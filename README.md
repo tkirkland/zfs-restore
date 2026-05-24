@@ -46,8 +46,8 @@ Current implementation status:
 - `rebuild-layout`: implemented
 - `backup`: implemented
 - `restore-data`: implemented
-- `repair-boot`: scaffold only
-- `full-restore`: scaffold only
+- `repair-boot`: implemented
+- `full-restore`: implemented
 
 ## Scope Boundary
 
@@ -55,6 +55,8 @@ The currently implemented scope is:
 
 - backup creation/retention
 - data restore from existing NAS backup archives
+- boot repair for the restored system
+- full-restore orchestration across the implemented phases
 - storage-layout verification
 - storage-layout reconstruction
 
@@ -67,6 +69,12 @@ That means the script currently does:
 - verify the selected restore archive before applying it
 - receive the selected backup stream into the rebuilt recovery pool
 - verify the rebuilt semantic storage layout again after restore
+- mount the restored root plus md-backed `/boot` and `/boot/efi` for boot repair
+- rewrite restored `fstab` and `mdadm.conf` for the rebuilt md/filesystem UUIDs
+- repopulate `/boot` by reinstalling the restored system's installed `linux-image-*` packages
+- regenerate initramfs and GRUB configuration
+- install EFI boot files and verify boot-critical artifacts before completion
+- orchestrate rebuild, data restore, and boot repair under `full-restore`
 - verify whether the expected storage scaffold already exists
 - rebuild the storage scaffold when requested
 - recreate mdraid EFI/boot/swap structure
@@ -74,11 +82,7 @@ That means the script currently does:
 
 That means the script currently does not:
 
-- receive ZFS backup data into the rebuilt pool
-- restore `/boot` contents
-- restore `/boot/efi` contents
-- install or repair GRUB
-- guarantee bootability
+- prove bootability by itself without an actual recovery drill and reboot test
 
 ## Semantic Contract
 
@@ -111,7 +115,7 @@ Its current behavior:
 
 Important implication:
 
-- because the current backup script does not back up `/boot` or `/boot/efi`, end-to-end bootability cannot yet be guaranteed by this project in its current phase
+- because the current backup script does not back up `/boot` or `/boot/efi`, this project restores bootability by rebuilding boot artifacts after data restore rather than restoring those directories from archive
 
 Design decisions now settled for this project:
 
@@ -126,16 +130,19 @@ Current implementation note:
 
 - `precision-dr.sh backup` now implements the backup behavior directly in the monolithic project script
 - `precision-dr.sh restore-data` now implements archive selection, verification, and ZFS receive directly in the monolithic project script
+- `precision-dr.sh repair-boot` now implements chroot-based boot repair directly in the monolithic project script
+- `precision-dr.sh full-restore` now implements the synthetic orchestration mode over the real recovery phases
 - `/usr/local/bin/zfs-backup.sh` remains the historical reference input for behavior, not a separate design authority
 - when a required command is missing, `precision-dr.sh` now attempts package installation automatically
 - automatic package installation currently supports Debian-family systems only, including Debian and Ubuntu variants
 - package installation is based on an explicit command-to-package map, not inference from command names
 
-Current design direction for the unresolved boot gap:
+Current boot-repair implementation direction:
 
-- do not start by adding `/boot` or `/boot/efi` into the backup archive format
+- `/boot` and `/boot/efi` are still not part of the ZFS backup archive format
 - instead, restore ZFS data into the rebuilt layout and then automate boot repair
-- the restore flow must complete in a bootable state; it should not stop at data restore and expect the user to repair boot manually
+- because `/boot` is not restored from ZFS, `repair-boot` repopulates `/boot` by reinstalling the restored system's installed `linux-image-*` packages
+- the restore flow is intended to complete in a bootable state without requiring a manual chroot session from the user
 
 ## Live Layout This Scaffold Models
 
@@ -211,15 +218,11 @@ The expected automated `repair-boot` behavior is:
   `proc`, `sys`, and likely `run`
 - chroot into the restored system
 - ensure boot-critical configuration is correct for the rebuilt layout
+- rewrite restored `fstab` and `mdadm.conf` for the rebuilt UUIDs
+- repopulate `/boot` by reinstalling the restored system's installed `linux-image-*` packages
 - regenerate initramfs and GRUB configuration
 - install the EFI bootloader for both EFI-backed disks
 - verify boot-critical files exist before reporting success
-
-This boot-repair automation is the preferred first path.
-
-For now, separate backup/restore of `/boot` or `/boot/efi` is not the
-planned starting design unless later testing shows regeneration is not
-reliable enough.
 
 ## Phase Testing
 

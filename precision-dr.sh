@@ -112,10 +112,10 @@ Implemented modes:
   rebuild-layout   Destructively recreate that scaffold in a live OS.
   restore-data     Mount the NAS, let the user choose a backup archive, and
                    receive it into the recovery pool.
-
-Planned modes:
-  repair-boot
-  full-restore
+  repair-boot      Rebuild /boot and EFI bootability inside the restored
+                   system.
+  full-restore     Run rebuild-layout, restore-data, and repair-boot as one
+                   recovery flow.
 
 Compatibility aliases:
   check            Alias for check-layout
@@ -130,8 +130,7 @@ Options:
 
 Scope notes:
   - This script is the unified DR scaffold for the project.
-  - Current implementation covers backup, storage verification/rebuild, and data restore.
-  - It does not yet repair bootability.
+  - Current implementation covers backup, storage verification/rebuild, data restore, and boot repair.
   - Semantic equivalence is the contract; exact UUID/GUID recreation is not.
 EOF
 }
@@ -192,8 +191,11 @@ package_for_command() {
     awk)
       printf 'gawk\n'
       ;;
-    blkid|mount|mountpoint|mkswap|sfdisk|umount|wipefs)
+    blkid|findmnt|mount|mountpoint|mkswap|sfdisk|umount|wipefs)
       printf 'util-linux\n'
+      ;;
+    chroot)
+      printf 'coreutils\n'
       ;;
     find)
       printf 'findutils\n'
@@ -589,6 +591,8 @@ run_backup() {
   prune_old_backup_snapshots
   prune_old_backup_files
   sync_backup_to_cloud "${backup_file}"
+  cleanup_backup_mount
+  trap - EXIT
 }
 
 
@@ -743,7 +747,224 @@ run_restore_data() {
 
   verify_restored_snapshot "${backup_path}"
   run_check_layout || fatal "Restore completed, but verification still reports mismatches."
+  cleanup_backup_mount
+  trap - EXIT
   info "Restore data completed and verified."
+}
+
+
+mount_recovery_root_dataset() {
+  local mounted_source=""
+
+  import_pool_for_recovery
+  mkdir -p "${RECOVERY_ROOT}"
+  mounted_source="$(findmnt -rn -o SOURCE --target "${RECOVERY_ROOT}" 2>/dev/null || true)"
+  if [[ "${mounted_source}" != "${ROOT_DATASET}" ]]; then
+    info "Mounting restored root dataset at ${RECOVERY_ROOT}..."
+    zfs mount "${ROOT_DATASET}"
+  fi
+
+  zfs mount -a
+}
+
+
+mount_recovery_boot_filesystems() {
+  mkdir -p "${RECOVERY_ROOT}/boot/efi"
+
+  if ! mountpoint -q "${RECOVERY_ROOT}/boot"; then
+    info "Mounting /boot recovery filesystem..."
+    mount /dev/md/boot "${RECOVERY_ROOT}/boot"
+  fi
+
+  if ! mountpoint -q "${RECOVERY_ROOT}/boot/efi"; then
+    info "Mounting /boot/efi recovery filesystem..."
+    mount /dev/md/efi "${RECOVERY_ROOT}/boot/efi"
+  fi
+}
+
+
+mount_recovery_chroot_support() {
+  mkdir -p \
+    "${RECOVERY_ROOT}/dev" \
+    "${RECOVERY_ROOT}/dev/pts" \
+    "${RECOVERY_ROOT}/proc" \
+    "${RECOVERY_ROOT}/sys" \
+    "${RECOVERY_ROOT}/run"
+
+  mountpoint -q "${RECOVERY_ROOT}/dev" || mount --bind /dev "${RECOVERY_ROOT}/dev"
+  mountpoint -q "${RECOVERY_ROOT}/dev/pts" || mount --bind /dev/pts "${RECOVERY_ROOT}/dev/pts"
+  mountpoint -q "${RECOVERY_ROOT}/proc" || mount --bind /proc "${RECOVERY_ROOT}/proc"
+  mountpoint -q "${RECOVERY_ROOT}/sys" || mount --bind /sys "${RECOVERY_ROOT}/sys"
+  mountpoint -q "${RECOVERY_ROOT}/run" || mount --bind /run "${RECOVERY_ROOT}/run"
+}
+
+
+cleanup_recovery_chroot_mounts() {
+  umount "${RECOVERY_ROOT}/run" 2>/dev/null || true
+  umount "${RECOVERY_ROOT}/sys" 2>/dev/null || true
+  umount "${RECOVERY_ROOT}/proc" 2>/dev/null || true
+  umount "${RECOVERY_ROOT}/dev/pts" 2>/dev/null || true
+  umount "${RECOVERY_ROOT}/dev" 2>/dev/null || true
+  umount "${RECOVERY_ROOT}/boot/efi" 2>/dev/null || true
+  umount "${RECOVERY_ROOT}/boot" 2>/dev/null || true
+}
+
+
+cleanup_recovery_pool_mounts() {
+  zfs unmount -a 2>/dev/null || true
+}
+
+
+export_recovery_pool() {
+  info "Exporting pool ${POOL_NAME}..."
+  zpool export -f "${POOL_NAME}"
+}
+
+
+run_in_recovery_chroot() {
+  chroot "${RECOVERY_ROOT}" /usr/bin/env bash -lc "$*"
+}
+
+
+write_recovery_fstab() {
+  local boot_uuid=""
+  local efi_uuid=""
+  local swap_uuid=""
+
+  boot_uuid="$(blkid_value /dev/md/boot UUID)"
+  efi_uuid="$(blkid_value /dev/md/efi UUID)"
+  swap_uuid="$(blkid_value /dev/md/swap UUID)"
+
+  [[ -n "${boot_uuid}" ]] || fatal "Unable to determine UUID for /dev/md/boot"
+  [[ -n "${efi_uuid}" ]] || fatal "Unable to determine UUID for /dev/md/efi"
+  [[ -n "${swap_uuid}" ]] || fatal "Unable to determine UUID for /dev/md/swap"
+
+  cat > "${RECOVERY_ROOT}/etc/fstab" <<EOF
+# /etc/fstab - static file system information
+# Rewritten by ${SCRIPT_NAME} during repair-boot
+
+# Boot partition (mdadm RAID1 + ext4)
+UUID=${boot_uuid}  /boot      ext4  defaults,noatime,nofail  0  1
+
+# EFI partition (mdadm RAID1 + FAT32)
+UUID=${efi_uuid}   /boot/efi  vfat  defaults,noatime,nofail,umask=0077  0  1
+
+# Swap (mdadm RAID0)
+UUID=${swap_uuid}  none       swap  sw,nofail  0  0
+EOF
+}
+
+
+write_recovery_mdadm_conf() {
+  local md_scan=""
+
+  md_scan="$(mdadm --detail --scan)"
+  cat > "${RECOVERY_ROOT}/etc/mdadm/mdadm.conf" <<EOF
+# mdadm.conf - Configuration for mdadm RAID arrays
+# Rewritten by ${SCRIPT_NAME} during repair-boot
+
+HOMEHOST <system>
+MAILADDR root
+
+# RAID array definitions
+${md_scan}
+EOF
+}
+
+
+set_recovery_zpool_cachefile() {
+  mkdir -p "${RECOVERY_ROOT}/etc/zfs"
+  run_in_recovery_chroot "zpool set cachefile=/etc/zfs/zpool.cache ${POOL_NAME}"
+}
+
+
+list_installed_recovery_kernel_packages() {
+  # shellcheck disable=SC2016
+  local dpkg_format='${binary:Package}\t${Status}\n'
+
+  chroot "${RECOVERY_ROOT}" dpkg-query -W -f="${dpkg_format}" 'linux-image-[0-9]*' 2>/dev/null | \
+    awk '$2 == "install" && $3 == "ok" && $4 == "installed" {print $1}'
+}
+
+
+reinstall_recovery_kernel_packages() {
+  local kernel_packages=()
+
+  mapfile -t kernel_packages < <(list_installed_recovery_kernel_packages)
+  (( ${#kernel_packages[@]} > 0 )) || fatal "No installed linux-image packages were found in the restored system."
+
+  info "Refreshing apt metadata inside the restored system..."
+  chroot "${RECOVERY_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
+
+  info "Reinstalling restored kernel packages to repopulate /boot..."
+  chroot "${RECOVERY_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y --reinstall "${kernel_packages[@]}"
+}
+
+
+rebuild_recovery_boot_configuration() {
+  info "Rebuilding initramfs for all installed kernels..."
+  run_in_recovery_chroot "update-initramfs -u -k all"
+
+  info "Regenerating GRUB configuration..."
+  run_in_recovery_chroot "update-grub"
+
+  info "Installing GRUB EFI files into the mirrored EFI filesystem..."
+  run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck"
+  run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --removable --recheck"
+}
+
+
+verify_recovery_boot_artifacts() {
+  [[ -L "${RECOVERY_ROOT}/boot/vmlinuz" ]] || fatal "Missing /boot/vmlinuz symlink after repair."
+  [[ -L "${RECOVERY_ROOT}/boot/initrd.img" ]] || fatal "Missing /boot/initrd.img symlink after repair."
+  [[ -s "${RECOVERY_ROOT}/boot/grub/grub.cfg" ]] || fatal "Missing /boot/grub/grub.cfg after repair."
+  [[ -s "${RECOVERY_ROOT}/boot/efi/EFI/ubuntu/shimx64.efi" ]] || fatal "Missing EFI ubuntu shim after repair."
+  [[ -s "${RECOVERY_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || fatal "Missing fallback EFI bootloader after repair."
+}
+
+
+run_repair_boot() {
+  require_live_environment
+  trap 'cleanup_recovery_chroot_mounts; cleanup_recovery_pool_mounts' EXIT
+
+  import_pool_for_recovery
+  run_check_layout || fatal "repair-boot requires a valid rebuilt/restored layout first."
+  mount_recovery_root_dataset
+  mount_recovery_boot_filesystems
+  mount_recovery_chroot_support
+
+  info "Rewriting restored system fstab and mdadm.conf..."
+  write_recovery_fstab
+  write_recovery_mdadm_conf
+
+  info "Refreshing zpool cache inside the restored system..."
+  set_recovery_zpool_cachefile
+
+  reinstall_recovery_kernel_packages
+  rebuild_recovery_boot_configuration
+  verify_recovery_boot_artifacts
+
+  cleanup_recovery_chroot_mounts
+  cleanup_recovery_pool_mounts
+  export_recovery_pool
+  trap - EXIT
+  info "Boot repair completed and verified."
+}
+
+
+run_full_restore() {
+  require_live_environment
+
+  if check_layout; then
+    info "Storage layout already matches the expected semantic scaffold. Skipping rebuild."
+  else
+    run_rebuild_layout
+  fi
+
+  run_restore_data
+  run_repair_boot
+  info "Full restore completed."
 }
 
 
@@ -1059,7 +1280,7 @@ require_mode_commands() {
   require_command zpool
   require_command zfs
 
-  if [[ "${MODE}" == "backup" ]]; then
+  if [[ "${MODE}" == "backup" || "${MODE}" == "full-restore" ]]; then
     require_command mount
     require_command mountpoint
     require_command umount
@@ -1067,7 +1288,7 @@ require_mode_commands() {
     require_command find
   fi
 
-  if [[ "${MODE}" == "restore-data" ]]; then
+  if [[ "${MODE}" == "restore-data" || "${MODE}" == "full-restore" ]]; then
     require_command mount
     require_command mountpoint
     require_command umount
@@ -1078,13 +1299,24 @@ require_mode_commands() {
     require_command blkid
   fi
 
-  if [[ "${MODE}" == "check-layout" || "${MODE}" == "rebuild-layout" ]]; then
+  if [[ "${MODE}" == "repair-boot" || "${MODE}" == "full-restore" ]]; then
+    require_command mount
+    require_command mountpoint
+    require_command umount
+    require_command findmnt
+    require_command chroot
+    require_command mdadm
+    require_command blkid
+    require_command awk
+  fi
+
+  if [[ "${MODE}" == "check-layout" || "${MODE}" == "rebuild-layout" || "${MODE}" == "full-restore" ]]; then
     require_command sfdisk
     require_command mdadm
     require_command blkid
   fi
 
-  if [[ "${MODE}" == "rebuild-layout" ]]; then
+  if [[ "${MODE}" == "rebuild-layout" || "${MODE}" == "full-restore" ]]; then
     require_command sgdisk
     require_command mkfs.vfat
     require_command mkfs.ext4
@@ -1113,8 +1345,11 @@ dispatch_mode() {
     restore-data)
       run_restore_data
       ;;
-    repair-boot|full-restore)
-      not_implemented
+    repair-boot)
+      run_repair_boot
+      ;;
+    full-restore)
+      run_full_restore
       ;;
     *)
       fatal "Unhandled mode: ${MODE}"
