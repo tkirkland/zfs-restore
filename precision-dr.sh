@@ -110,9 +110,10 @@ Implemented modes:
   check-layout     Verify that the target storage layout already matches the
                    expected restore-ready scaffold.
   rebuild-layout   Destructively recreate that scaffold in a live OS.
+  restore-data     Mount the NAS, let the user choose a backup archive, and
+                   receive it into the recovery pool.
 
 Planned modes:
-  restore-data
   repair-boot
   full-restore
 
@@ -129,9 +130,8 @@ Options:
 
 Scope notes:
   - This script is the unified DR scaffold for the project.
-  - Current implementation covers backup plus storage verification/rebuild.
-  - It does not currently restore ZFS data.
-  - It does not currently restore or repair bootability.
+  - Current implementation covers backup, storage verification/rebuild, and data restore.
+  - It does not yet repair bootability.
   - Semantic equivalence is the contract; exact UUID/GUID recreation is not.
 EOF
 }
@@ -592,6 +592,161 @@ run_backup() {
 }
 
 
+backup_timestamp_from_path() {
+  local backup_path="$1"
+  local backup_name=""
+
+  backup_name="$(basename -- "${backup_path}")"
+  [[ "${backup_name}" == precision-*.zfs.zst ]] || fatal "Backup file name does not match expected pattern: ${backup_name}"
+  backup_name="${backup_name#precision-}"
+  printf '%s\n' "${backup_name%.zfs.zst}"
+}
+
+
+verify_backup_archive() {
+  local backup_path="$1"
+
+  [[ -f "${backup_path}" ]] || fatal "Backup archive does not exist: ${backup_path}"
+  [[ -s "${backup_path}" ]] || fatal "Backup archive is empty: ${backup_path}"
+
+  info "Verifying backup archive ${backup_path}..."
+  zstd -t "${backup_path}"
+}
+
+
+choose_backup_archive() {
+  local entries=()
+  local entry=""
+  local choice=""
+  local choice_index=0
+  local display_index=0
+  local backup_name=""
+  local backup_path=""
+
+  mapfile -t entries < <(find "${BACKUP_MOUNT}" -maxdepth 1 -name "${BACKUP_FILE_GLOB}" -type f -printf '%f\t%p\n' 2>/dev/null | sort -r)
+  (( ${#entries[@]} > 0 )) || fatal "No backup archives were found under ${BACKUP_MOUNT}."
+
+  printf 'Available backups (newest first):\n' >&2
+  for entry in "${entries[@]}"; do
+    backup_name="${entry%%$'\t'*}"
+    display_index=$(( display_index + 1 ))
+    printf '  %d) %s\n' "${display_index}" "${backup_name}" >&2
+  done
+
+  while true; do
+    printf 'Select backup number to restore: ' >&2
+    read -r choice
+    [[ "${choice}" =~ ^[0-9]+$ ]] || {
+      warn "Enter a numeric selection."
+      continue
+    }
+
+    choice_index=$(( choice - 1 ))
+    if (( choice_index < 0 || choice_index >= ${#entries[@]} )); then
+      warn "Selection out of range."
+      continue
+    fi
+
+    backup_path="${entries[choice_index]#*$'\t'}"
+    printf '%s\n' "${backup_path}"
+    return 0
+  done
+}
+
+
+confirm_restore_data() {
+  local backup_path="$1"
+
+  if (( ASSUME_YES == 1 )); then
+    return 0
+  fi
+
+  printf 'This will overwrite the contents of pool %s using:\n' "${POOL_NAME}"
+  printf '  %s\n' "${backup_path}"
+  printf "Type 'restore' to continue: "
+  local answer=""
+  read -r answer
+  [[ "${answer}" == "restore" ]] || fatal "Aborted."
+}
+
+
+import_pool_for_recovery() {
+  if zpool list "${POOL_NAME}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  info "Importing pool ${POOL_NAME} for recovery..."
+  zpool import -N -R "${RECOVERY_ROOT}" -d /dev/disk/by-id "${POOL_NAME}"
+}
+
+
+destroy_existing_pool_datasets() {
+  local datasets=()
+  local index=0
+
+  mapfile -t datasets < <(zfs list -H -o name -r "${POOL_NAME}" 2>/dev/null | tail -n +2 || true)
+  if (( ${#datasets[@]} == 0 )); then
+    return 0
+  fi
+
+  info "Destroying existing datasets in ${POOL_NAME} before restore..."
+  for (( index=${#datasets[@]} - 1; index>=0; index-- )); do
+    zfs destroy -r "${datasets[index]}"
+  done
+}
+
+
+destroy_existing_pool_snapshots() {
+  local snapshots=()
+  local index=0
+
+  mapfile -t snapshots < <(zfs list -H -t snapshot -o name -s creation -r "${POOL_NAME}" 2>/dev/null || true)
+  if (( ${#snapshots[@]} == 0 )); then
+    return 0
+  fi
+
+  info "Destroying existing snapshots in ${POOL_NAME} before restore..."
+  for (( index=${#snapshots[@]} - 1; index>=0; index-- )); do
+    zfs destroy "${snapshots[index]}"
+  done
+}
+
+
+verify_restored_snapshot() {
+  local backup_path="$1"
+  local expected_snapshot=""
+  local timestamp=""
+
+  timestamp="$(backup_timestamp_from_path "${backup_path}")"
+  expected_snapshot="${POOL_NAME}@backup-${timestamp}"
+  zfs list -H -t snapshot -o name "${expected_snapshot}" >/dev/null 2>&1 || fatal "Expected restored snapshot is missing: ${expected_snapshot}"
+}
+
+
+run_restore_data() {
+  local backup_path=""
+
+  require_live_environment
+  trap cleanup_backup_mount EXIT
+
+  mount_backup_target
+  backup_path="$(choose_backup_archive)"
+  confirm_restore_data "${backup_path}"
+  verify_backup_archive "${backup_path}"
+
+  import_pool_for_recovery
+  destroy_existing_pool_snapshots
+  destroy_existing_pool_datasets
+
+  info "Receiving backup stream from ${backup_path} into ${POOL_NAME}..."
+  zstd -d -c "${backup_path}" | zfs receive -u -F "${POOL_NAME}"
+
+  verify_restored_snapshot "${backup_path}"
+  run_check_layout || fatal "Restore completed, but verification still reports mismatches."
+  info "Restore data completed and verified."
+}
+
+
 check_layout() {
   local disk1_real=""
   local disk2_real=""
@@ -912,6 +1067,17 @@ require_mode_commands() {
     require_command find
   fi
 
+  if [[ "${MODE}" == "restore-data" ]]; then
+    require_command mount
+    require_command mountpoint
+    require_command umount
+    require_command zstd
+    require_command find
+    require_command sfdisk
+    require_command mdadm
+    require_command blkid
+  fi
+
   if [[ "${MODE}" == "check-layout" || "${MODE}" == "rebuild-layout" ]]; then
     require_command sfdisk
     require_command mdadm
@@ -944,7 +1110,10 @@ dispatch_mode() {
       fi
       run_rebuild_layout
       ;;
-    restore-data|repair-boot|full-restore)
+    restore-data)
+      run_restore_data
+      ;;
+    repair-boot|full-restore)
       not_implemented
       ;;
     *)

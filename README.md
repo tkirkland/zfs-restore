@@ -45,7 +45,7 @@ Current implementation status:
 - `check-layout`: implemented
 - `rebuild-layout`: implemented
 - `backup`: implemented
-- `restore-data`: scaffold only
+- `restore-data`: implemented
 - `repair-boot`: scaffold only
 - `full-restore`: scaffold only
 
@@ -54,6 +54,7 @@ Current implementation status:
 The currently implemented scope is:
 
 - backup creation/retention
+- data restore from existing NAS backup archives
 - storage-layout verification
 - storage-layout reconstruction
 
@@ -62,6 +63,10 @@ That means the script currently does:
 - create a recursive compressed ZFS backup on the NAS
 - verify the written backup archive after creation
 - apply retention to backup snapshots and NAS archive files
+- mount the NAS and present existing backup archives newest-first for restore selection
+- verify the selected restore archive before applying it
+- receive the selected backup stream into the rebuilt recovery pool
+- verify the rebuilt semantic storage layout again after restore
 - verify whether the expected storage scaffold already exists
 - rebuild the storage scaffold when requested
 - recreate mdraid EFI/boot/swap structure
@@ -120,6 +125,7 @@ Design decisions now settled for this project:
 Current implementation note:
 
 - `precision-dr.sh backup` now implements the backup behavior directly in the monolithic project script
+- `precision-dr.sh restore-data` now implements archive selection, verification, and ZFS receive directly in the monolithic project script
 - `/usr/local/bin/zfs-backup.sh` remains the historical reference input for behavior, not a separate design authority
 - when a required command is missing, `precision-dr.sh` now attempts package installation automatically
 - automatic package installation currently supports Debian-family systems only, including Debian and Ubuntu variants
