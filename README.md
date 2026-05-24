@@ -29,10 +29,6 @@ The authoritative script is:
 
 - [precision-dr.sh](/home/me/code/rebuild-drv-layout/precision-dr.sh)
 
-Compatibility wrapper:
-
-- [rebuild-storage-layout.sh](/home/me/code/rebuild-drv-layout/rebuild-storage-layout.sh)
-
 ## Phase Model
 
 The intended end state is one script with these modes:
