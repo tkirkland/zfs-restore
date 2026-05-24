@@ -44,17 +44,24 @@ Current implementation status:
 
 - `check-layout`: implemented
 - `rebuild-layout`: implemented
-- `backup`: scaffold only
+- `backup`: implemented
 - `restore-data`: scaffold only
 - `repair-boot`: scaffold only
 - `full-restore`: scaffold only
 
 ## Scope Boundary
 
-The currently implemented scope is storage-layout reconstruction only.
+The currently implemented scope is:
+
+- backup creation/retention
+- storage-layout verification
+- storage-layout reconstruction
 
 That means the script currently does:
 
+- create a recursive compressed ZFS backup on the NAS
+- verify the written backup archive after creation
+- apply retention to backup snapshots and NAS archive files
 - verify whether the expected storage scaffold already exists
 - rebuild the storage scaffold when requested
 - recreate mdraid EFI/boot/swap structure
@@ -62,7 +69,6 @@ That means the script currently does:
 
 That means the script currently does not:
 
-- create or verify backup archives
 - receive ZFS backup data into the rebuilt pool
 - restore `/boot` contents
 - restore `/boot/efi` contents
@@ -107,9 +113,17 @@ Design decisions now settled for this project:
 - the existing `.zfs.zst` archives produced by `/usr/local/bin/zfs-backup.sh` are valid restore sources
 - restore should consume those archives as-is
 - restore should not introduce remapping, rename logic, alternate dataset targets, manifests, or a new backup format
-- the monolithic project script should eventually absorb backup behavior so backup and restore live in one script
+- the monolithic project script should own backup and restore behavior in one place
 - the NAS path used by the current backup script is the authoritative restore source location
 - restore should mount the NAS and present available backups to the user newest-first as a numbered menu
+
+Current implementation note:
+
+- `precision-dr.sh backup` now implements the backup behavior directly in the monolithic project script
+- `/usr/local/bin/zfs-backup.sh` remains the historical reference input for behavior, not a separate design authority
+- when a required command is missing, `precision-dr.sh` now attempts package installation automatically
+- automatic package installation currently supports Debian-family systems only, including Debian and Ubuntu variants
+- package installation is based on an explicit command-to-package map, not inference from command names
 
 Current design direction for the unresolved boot gap:
 

@@ -17,6 +17,13 @@ readonly SCRIPT_NAME
 readonly POOL_NAME="PRECISION"
 readonly ROOT_DATASET="${POOL_NAME}/ROOT/kubuntu"
 readonly RECOVERY_ROOT="/mnt/recovery"
+readonly BACKUP_NAS="rackstation"
+readonly BACKUP_SHARE="/Backup"
+readonly BACKUP_MOUNT="/mnt/synology"
+readonly BACKUP_CREDENTIALS="/etc/sysbackup/nas.cred"
+readonly BACKUP_KEEP_COUNT=4
+readonly BACKUP_FILE_GLOB="precision-*.zfs.zst"
+readonly CLOUD_SYNC_TARGET="gdrive:precision-backups/"
 
 readonly DEFAULT_DISK1="/dev/disk/by-id/nvme-eui.0025384331408197"
 readonly DEFAULT_DISK2="/dev/disk/by-id/nvme-eui.002538433140818a"
@@ -62,6 +69,8 @@ DISK2="${DEFAULT_DISK2}"
 DISK3="${DEFAULT_DISK3}"
 ASSUME_YES=0
 CHECK_FAILED=0
+BACKUP_MOUNTED_BY_SCRIPT=0
+APT_UPDATED=0
 
 
 info() {
@@ -96,12 +105,13 @@ Usage:
   sudo ./${SCRIPT_NAME} <mode> [options]
 
 Implemented modes:
+  backup           Create a recursive compressed ZFS backup on the NAS and
+                   apply retention.
   check-layout     Verify that the target storage layout already matches the
                    expected restore-ready scaffold.
   rebuild-layout   Destructively recreate that scaffold in a live OS.
 
 Planned modes:
-  backup
   restore-data
   repair-boot
   full-restore
@@ -119,7 +129,7 @@ Options:
 
 Scope notes:
   - This script is the unified DR scaffold for the project.
-  - Current implementation covers storage verification/rebuild only.
+  - Current implementation covers backup plus storage verification/rebuild.
   - It does not currently restore ZFS data.
   - It does not currently restore or repair bootability.
   - Semantic equivalence is the contract; exact UUID/GUID recreation is not.
@@ -141,7 +151,105 @@ require_live_environment() {
 
 require_command() {
   local cmd="$1"
-  command -v "${cmd}" >/dev/null 2>&1 || fatal "Required command not found: ${cmd}"
+  if command -v "${cmd}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  warn "Required command not found: ${cmd}"
+  install_package_for_command "${cmd}"
+
+  command -v "${cmd}" >/dev/null 2>&1 || fatal "Required command still not found after installation attempt: ${cmd}"
+}
+
+
+load_os_release() {
+  [[ -r /etc/os-release ]] || fatal "Cannot detect operating system: /etc/os-release is missing."
+  # shellcheck disable=SC1091
+  . /etc/os-release
+}
+
+
+require_debian_family() {
+  local os_id=""
+  local os_like=""
+
+  load_os_release
+  os_id="${ID:-}"
+  os_like="${ID_LIKE:-}"
+
+  if [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_like}" == *debian* ]]; then
+    return 0
+  fi
+
+  fatal "Automatic package installation is only supported on Debian/Ubuntu-based systems. Detected ID='${os_id}' ID_LIKE='${os_like}'."
+}
+
+
+package_for_command() {
+  local cmd="$1"
+
+  case "${cmd}" in
+    awk)
+      printf 'gawk\n'
+      ;;
+    blkid|mount|mountpoint|mkswap|sfdisk|umount|wipefs)
+      printf 'util-linux\n'
+      ;;
+    find)
+      printf 'findutils\n'
+      ;;
+    mdadm)
+      printf 'mdadm\n'
+      ;;
+    mkfs.ext4)
+      printf 'e2fsprogs\n'
+      ;;
+    mkfs.vfat)
+      printf 'dosfstools\n'
+      ;;
+    partprobe)
+      printf 'parted\n'
+      ;;
+    sgdisk)
+      printf 'gdisk\n'
+      ;;
+    udevadm)
+      printf 'udev\n'
+      ;;
+    zfs|zpool)
+      printf 'zfsutils-linux\n'
+      ;;
+    zstd)
+      printf 'zstd\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+
+apt_update_once() {
+  if (( APT_UPDATED == 1 )); then
+    return 0
+  fi
+
+  info "Refreshing apt package metadata..."
+  DEBIAN_FRONTEND=noninteractive apt-get update
+  APT_UPDATED=1
+}
+
+
+install_package_for_command() {
+  local cmd="$1"
+  local package_name=""
+
+  require_debian_family
+  package_name="$(package_for_command "${cmd}")" || fatal "No package mapping is defined for required command: ${cmd}"
+
+  apt_update_once
+  info "Installing package '${package_name}' for missing command '${cmd}'..."
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${package_name}"
 }
 
 
@@ -361,6 +469,126 @@ check_dataset_scaffold() {
     IFS='|' read -r dataset property expected <<<"${spec}"
     check_zfs_property "${dataset}" "${property}" "${expected}"
   done
+}
+
+
+cleanup_backup_mount() {
+  if (( BACKUP_MOUNTED_BY_SCRIPT == 1 )) && mountpoint -q "${BACKUP_MOUNT}"; then
+    umount "${BACKUP_MOUNT}" 2>/dev/null || true
+  fi
+}
+
+
+mount_backup_target() {
+  mkdir -p "${BACKUP_MOUNT}"
+
+  if mountpoint -q "${BACKUP_MOUNT}"; then
+    info "Backup target already mounted at ${BACKUP_MOUNT}."
+    return 0
+  fi
+
+  info "Mounting backup target at ${BACKUP_MOUNT}..."
+  mount -t cifs "//${BACKUP_NAS}${BACKUP_SHARE}" "${BACKUP_MOUNT}" -o credentials="${BACKUP_CREDENTIALS}"
+  BACKUP_MOUNTED_BY_SCRIPT=1
+}
+
+
+prune_old_backup_snapshots() {
+  local snapshots=()
+  local remove_count=0
+  local snapshot=""
+
+  mapfile -t snapshots < <(zfs list -H -t snapshot -o name -s creation | grep "^${POOL_NAME}@backup-" || true)
+  remove_count=$(( ${#snapshots[@]} - BACKUP_KEEP_COUNT ))
+  if (( remove_count <= 0 )); then
+    return 0
+  fi
+
+  for snapshot in "${snapshots[@]:0:remove_count}"; do
+    info "Pruning old snapshot ${snapshot}..."
+    zfs destroy -r "${snapshot}"
+  done
+}
+
+
+prune_old_backup_files() {
+  local entries=()
+  local remove_count=0
+  local entry=""
+  local file_path=""
+
+  mapfile -t entries < <(find "${BACKUP_MOUNT}" -maxdepth 1 -name "${BACKUP_FILE_GLOB}" -type f -printf '%T@\t%p\n' 2>/dev/null | sort -n)
+  remove_count=$(( ${#entries[@]} - BACKUP_KEEP_COUNT ))
+  if (( remove_count <= 0 )); then
+    return 0
+  fi
+
+  for entry in "${entries[@]:0:remove_count}"; do
+    file_path="${entry#*$'\t'}"
+    info "Pruning old backup file ${file_path}..."
+    rm -f -- "${file_path}"
+  done
+}
+
+
+sync_backup_to_cloud() {
+  local backup_file="$1"
+  local sync_start=0
+  local sync_end=0
+  local sync_duration=0
+  local sync_size=0
+  local sync_speed=""
+
+  if ! command -v rclone >/dev/null 2>&1; then
+    warn "rclone not found; skipping cloud sync."
+    return 0
+  fi
+
+  sync_start="$(date +%s)"
+  if rclone sync "${BACKUP_MOUNT}/" "${CLOUD_SYNC_TARGET}" --include "${BACKUP_FILE_GLOB}"; then
+    sync_end="$(date +%s)"
+    sync_duration=$(( sync_end - sync_start ))
+    sync_size="$(stat -c '%s' "${backup_file}")"
+    if (( sync_duration > 0 )); then
+      sync_speed="$(awk "BEGIN {printf \"%.2f\", (${sync_size} * 8) / ${sync_duration} / 1000000000}")"
+      info "Cloud sync complete: ${sync_duration}s @ ${sync_speed} Gbps"
+    else
+      info "Cloud sync complete."
+    fi
+    return 0
+  fi
+
+  warn "Cloud sync failed."
+}
+
+
+run_backup() {
+  local timestamp=""
+  local snapshot=""
+  local backup_file=""
+  local backup_size=""
+
+  trap cleanup_backup_mount EXIT
+  mount_backup_target
+
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  snapshot="${POOL_NAME}@backup-${timestamp}"
+  backup_file="${BACKUP_MOUNT}/precision-${timestamp}.zfs.zst"
+
+  info "Creating recursive snapshot ${snapshot}..."
+  zfs snapshot -r "${snapshot}"
+
+  info "Writing compressed backup stream to ${backup_file}..."
+  zfs send -R "${snapshot}" | zstd -T0 > "${backup_file}"
+
+  [[ -s "${backup_file}" ]] || fatal "Backup file was created but is empty: ${backup_file}"
+  zstd -t "${backup_file}"
+  backup_size="$(du -h "${backup_file}" | awk '{print $1}')"
+  info "Backup archive verified: ${backup_size}"
+
+  prune_old_backup_snapshots
+  prune_old_backup_files
+  sync_backup_to_cloud "${backup_file}"
 }
 
 
@@ -673,11 +901,22 @@ parse_args() {
 
 
 require_mode_commands() {
-  require_command sfdisk
-  require_command mdadm
-  require_command blkid
   require_command zpool
   require_command zfs
+
+  if [[ "${MODE}" == "backup" ]]; then
+    require_command mount
+    require_command mountpoint
+    require_command umount
+    require_command zstd
+    require_command find
+  fi
+
+  if [[ "${MODE}" == "check-layout" || "${MODE}" == "rebuild-layout" ]]; then
+    require_command sfdisk
+    require_command mdadm
+    require_command blkid
+  fi
 
   if [[ "${MODE}" == "rebuild-layout" ]]; then
     require_command sgdisk
@@ -692,6 +931,9 @@ require_mode_commands() {
 
 dispatch_mode() {
   case "${MODE}" in
+    backup)
+      run_backup
+      ;;
     check-layout)
       run_check_layout
       ;;
@@ -702,7 +944,7 @@ dispatch_mode() {
       fi
       run_rebuild_layout
       ;;
-    backup|restore-data|repair-boot|full-restore)
+    restore-data|repair-boot|full-restore)
       not_implemented
       ;;
     *)
