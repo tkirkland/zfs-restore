@@ -4,6 +4,10 @@ This directory contains the unified disaster recovery scaffold for the `PRECISIO
 
 The project goal is a single script that can eventually handle the full live-boot recovery path with minimal user input while still being developed in explicit phases.
 
+## Quick Reference
+
+See [PROJECT_INDEX.md](PROJECT_INDEX.md) for a compact map of all functions, modes, constants, and storage topology — intended as a fast-load reference for new sessions.
+
 ## Authoritative Inputs
 
 Future sessions should treat the following as authoritative unless the user says otherwise:
@@ -144,7 +148,7 @@ Current boot-repair implementation direction:
 - because `/boot` is not restored from ZFS, `repair-boot` repopulates `/boot` by reinstalling the restored system's installed `linux-image-*` packages
 - the restore flow is intended to complete in a bootable state without requiring a manual chroot session from the user
 
-## Live Lay out This Scaffold Models
+## Live Layout This Scaffold Models
 
 The current scaffold is based on the storage layout of the running system:
 
