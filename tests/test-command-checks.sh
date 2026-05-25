@@ -14,7 +14,7 @@ trap cleanup EXIT
 
 # Load function definitions without executing main().
 # shellcheck disable=SC1090
-source <(sed '/^main "\$@"$/,$d' "${target_script}")
+source <(sed '/^# __END_LIBRARY__$/,$d' "${target_script}")
 
 
 fail() {
@@ -192,6 +192,7 @@ test_require_recovery_command_paths() {
   run_in_recovery_chroot() {
     [[ "$1" == *"command -v present-cmd "* ]]
   }
+  # shellcheck disable=SC2329
   fatal() {
     TEST_FATAL_MESSAGE="$*"
     return 1
@@ -313,6 +314,46 @@ full_restore_expected="$(printf '%s\n%s\n%s\n%s\n' \
   "${repair_expected}" \
   "${rebuild_expected}" | capture_sorted_unique_lines)"
 
+test_backup_timestamp_from_path() {
+  local result=""
+  local saved_fatal=""
+
+  saved_fatal="$(save_function fatal)"
+  # shellcheck disable=SC2329
+  fatal() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+  result="$(backup_timestamp_from_path "/mnt/nas/precision-20240101-120000.zfs.zst")"
+  assert_equals "${result}" "20240101-120000" "backup_timestamp_from_path: valid filename"
+
+  (backup_timestamp_from_path "/mnt/nas/not-a-backup.tar.gz" >/dev/null 2>&1) \
+    && fail "backup_timestamp_from_path accepted a non-matching filename" || true
+
+  (backup_timestamp_from_path "/mnt/nas/precision-badstamp.zfs.zst" >/dev/null 2>&1) \
+    && fail "backup_timestamp_from_path accepted a malformed timestamp" || true
+
+  restore_function fatal "${saved_fatal}"
+  pass "backup_timestamp_from_path valid and invalid paths"
+}
+
+
+test_check_filesystem_signature_missing_device() {
+  local saved_report_mismatch=""
+  local mismatch_called=0
+
+  saved_report_mismatch="$(save_function report_mismatch)"
+  # shellcheck disable=SC2329
+  report_mismatch() {
+    mismatch_called=1
+  }
+
+  check_filesystem_signature "/dev/nonexistent-device-xyz-$$" "ext4" "boot"
+  [[ "${mismatch_called}" -eq 1 ]] || fail "check_filesystem_signature did not report a mismatch for a missing device"
+
+  restore_function report_mismatch "${saved_report_mismatch}"
+  pass "check_filesystem_signature reports mismatch for missing device"
+}
+
+
 assert_mode_command_set "backup" "${backup_expected}"
 assert_mode_command_set "restore-data" "${restore_expected}"
 assert_mode_command_set "repair-boot" "${repair_expected}"
@@ -322,5 +363,7 @@ assert_mode_command_set "full-restore" "${full_restore_expected}"
 assert_package_mapping_for_commands "${full_restore_expected}"
 test_require_command_install_path_with_fake_apt
 test_require_recovery_command_paths
+test_backup_timestamp_from_path
+test_check_filesystem_signature_missing_device
 
 pass "all command-check tests"

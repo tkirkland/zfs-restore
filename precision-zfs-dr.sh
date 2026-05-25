@@ -33,6 +33,7 @@ readonly TYPE_EFI="C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
 readonly TYPE_LINUX_RAID="A19D880F-05FC-4D3B-A006-743F0F84911E"
 readonly TYPE_ZFS="6A85CF4D-1DD2-11B2-99A6-080020736631"
 
+# Dataset property scaffold. Must stay in sync with create_pool_and_datasets.
 readonly DATASET_SPECS=(
   "${POOL_NAME}|mountpoint|none"
   "${POOL_NAME}|canmount|off"
@@ -74,6 +75,10 @@ BACKUP_SNAPSHOT=""
 BACKUP_FILE_IN_PROGRESS=""
 APT_UPDATED=0
 
+
+##
+## Logging and usage
+##
 
 info() {
   printf '[INFO] %s\n' "$*"
@@ -132,6 +137,10 @@ Scope notes:
 EOF
 }
 
+
+##
+## Prerequisites and package management
+##
 
 require_root() {
   [[ "${EUID}" -eq 0 ]] || fatal "Run this script as root."
@@ -269,6 +278,10 @@ install_package_for_command() {
     fatal "Failed to install package '${package_name}' for required command '${cmd}'."
 }
 
+
+##
+## Disk validation, primitives, and layout verification
+##
 
 validate_by_id_disk() {
   local disk="$1"
@@ -512,6 +525,10 @@ sorted_join_lines() {
 }
 
 
+##
+## Backup
+##
+
 cleanup_backup_mount() {
   if (( BACKUP_MOUNTED_BY_SCRIPT == 1 )) && mountpoint -q "${BACKUP_MOUNT}"; then
     umount "${BACKUP_MOUNT}" 2>/dev/null || true
@@ -663,6 +680,10 @@ backup_timestamp_from_path() {
   printf '%s\n' "${timestamp}"
 }
 
+
+##
+## Restore data
+##
 
 verify_backup_archive() {
   local backup_path="$1"
@@ -817,6 +838,10 @@ run_restore_data() {
 }
 
 
+##
+## Recovery environment
+##
+
 mount_recovery_root_dataset() {
   local mounted_source=""
   local datasets=()
@@ -919,6 +944,10 @@ run_in_recovery_chroot() {
   chroot "${RECOVERY_ROOT}" /usr/bin/env bash -lc "$*"
 }
 
+
+##
+## Repair boot
+##
 
 write_recovery_fstab() {
   local boot_uuid=""
@@ -1112,21 +1141,21 @@ run_repair_boot() {
 }
 
 
+##
+## Layout check and full restore
+##
+
 run_full_restore() {
   require_live_environment
-
-  if check_layout; then
-    info "Storage layout already matches the expected semantic scaffold. Skipping rebuild."
-  else
-    run_rebuild_layout
-  fi
-
+  run_rebuild_layout
   run_restore_data
   run_repair_boot
   info "Full restore completed."
 }
 
 
+# Silent boolean predicate: returns 0 if the layout matches, 1 if not.
+# Never prints a summary. Use run_check_layout for user-visible output.
 check_layout() {
   local disk1_real=""
   local disk2_real=""
@@ -1174,6 +1203,10 @@ check_layout() {
   return "${CHECK_FAILED}"
 }
 
+
+##
+## Rebuild layout
+##
 
 destroy_or_export_pool() {
   if zpool list "${POOL_NAME}" >/dev/null 2>&1; then
@@ -1329,6 +1362,7 @@ format_arrays() {
 }
 
 
+# Creates the ZFS pool and datasets. Must stay in sync with DATASET_SPECS.
 create_pool_and_datasets() {
   mkdir -p "${RECOVERY_ROOT}"
 
@@ -1391,6 +1425,10 @@ run_check_layout() {
 
 run_rebuild_layout() {
   require_live_environment
+  if check_layout; then
+    info "Storage layout already matches the expected semantic scaffold."
+    return 0
+  fi
   confirm_rebuild
 
   info "Destroying any existing imported pool and md arrays..."
@@ -1417,6 +1455,10 @@ run_rebuild_layout() {
   info "Storage layout rebuilt and verified."
 }
 
+
+##
+## Entry point
+##
 
 parse_args() {
   [[ $# -gt 0 ]] || {
@@ -1558,10 +1600,6 @@ dispatch_mode() {
       run_check_layout
       ;;
     rebuild-layout)
-      if check_layout; then
-        info "Storage layout already matches the expected semantic scaffold."
-        return 0
-      fi
       run_rebuild_layout
       ;;
     restore-data)
@@ -1592,4 +1630,5 @@ main() {
 }
 
 
+# __END_LIBRARY__
 main "$@"
