@@ -94,11 +94,6 @@ fatal() {
 }
 
 
-not_implemented() {
-  fatal "${MODE} is scaffolded but not implemented yet."
-}
-
-
 usage() {
   cat <<EOF
 Usage:
@@ -154,7 +149,7 @@ require_command() {
     return 0
   fi
 
-  warn "Required command not found: ${cmd}"
+  warn "${cmd} is required but was not found; attempting installation..."
   install_package_for_command "${cmd}"
 
   command -v "${cmd}" >/dev/null 2>&1 || fatal "Required command still not found after installation attempt: ${cmd}"
@@ -191,14 +186,32 @@ package_for_command() {
     awk)
       printf 'gawk\n'
       ;;
-    blkid|findmnt|mount|mountpoint|mkswap|sfdisk|umount|wipefs)
+    apt-get)
+      printf 'apt\n'
+      ;;
+    basename|chroot|du|mkdir|paste|readlink|rm|sleep|sort|stat|tail)
+      printf 'coreutils\n'
+      ;;
+    blkdiscard|blkid|findmnt|mount|mountpoint|mkswap|sfdisk|swapoff|umount|wipefs)
       printf 'util-linux\n'
       ;;
-    chroot)
-      printf 'coreutils\n'
+    dpkg-query)
+      printf 'dpkg\n'
       ;;
     find)
       printf 'findutils\n'
+      ;;
+    grep)
+      printf 'grep\n'
+      ;;
+    mount.cifs)
+      printf 'cifs-utils\n'
+      ;;
+    grub-install|update-grub)
+      printf 'grub2-common\n'
+      ;;
+    update-initramfs)
+      printf 'initramfs-tools\n'
       ;;
     mdadm)
       printf 'mdadm\n'
@@ -236,8 +249,8 @@ apt_update_once() {
     return 0
   fi
 
-  info "Refreshing apt package metadata..."
-  DEBIAN_FRONTEND=noninteractive apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null 2>&1 || \
+    fatal "Failed to refresh apt package metadata."
   APT_UPDATED=1
 }
 
@@ -250,8 +263,8 @@ install_package_for_command() {
   package_name="$(package_for_command "${cmd}")" || fatal "No package mapping is defined for required command: ${cmd}"
 
   apt_update_once
-  info "Installing package '${package_name}' for missing command '${cmd}'..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "${package_name}"
+  DEBIAN_FRONTEND=noninteractive apt-get -qq install -y "${package_name}" >/dev/null 2>&1 || \
+    fatal "Failed to install package '${package_name}' for required command '${cmd}'."
 }
 
 
@@ -382,13 +395,8 @@ check_mdadm_array() {
   actual_name="$(awk -F': ' '/^[[:space:]]+Name : / {print $2}' <<<"${detail}")"
   expect_equal "${actual_name}" "${expected_name}" "${md_device} md name"
 
-  if [[ "${raid_level}" == "raid0" ]]; then
-    actual_members="$(awk '/active sync/ {print $NF}' <<<"${detail}" | sort | paste -sd',' -)"
-    expected_members_joined="$(printf '%s\n' "${expected_members[@]}" | sort | paste -sd',' -)"
-  else
-    actual_members="$(awk '/active sync/ {print $NF}' <<<"${detail}" | paste -sd',' -)"
-    expected_members_joined="$(printf '%s\n' "${expected_members[@]}" | paste -sd',' -)"
-  fi
+  actual_members="$(awk '/active sync/ {print $NF}' <<<"${detail}" | sorted_join_lines)"
+  expected_members_joined="$(printf '%s\n' "${expected_members[@]}" | sorted_join_lines)"
   expect_equal "${actual_members}" "${expected_members_joined}" "${md_device} member devices"
 
   scan="$(mdadm --detail --scan)"
@@ -426,11 +434,15 @@ check_zpool_members() {
   status="$(zpool status -P "${POOL_NAME}")"
   expect_line_present "${status}" "  pool: ${POOL_NAME}" "${POOL_NAME} pool name"
 
-  actual_members="$(awk '/\/dev\/disk\/by-id\// {print $1}' <<<"${status}" | paste -sd',' -)"
+  actual_members="$(awk '
+    /^config:/ {in_config=1; next}
+    /^errors:/ {in_config=0}
+    in_config && $1 ~ /^\/dev\/disk\/by-id\// {print $1}
+  ' <<<"${status}" | sorted_join_lines)"
   expected_members_joined="$(printf '%s\n' \
     "${DISK1}-part4" \
     "${DISK2}-part4" \
-    "${DISK3}-part2" | paste -sd',' -)"
+    "${DISK3}-part2" | sorted_join_lines)"
   expect_equal "${actual_members}" "${expected_members_joined}" "${POOL_NAME} vdev member paths"
 }
 
@@ -471,6 +483,19 @@ check_dataset_scaffold() {
     IFS='|' read -r dataset property expected <<<"${spec}"
     check_zfs_property "${dataset}" "${property}" "${expected}"
   done
+}
+
+
+zfs_dataset_value() {
+  local dataset="$1"
+  local property="$2"
+
+  zfs get -H -o value "${property}" "${dataset}" 2>/dev/null || true
+}
+
+
+sorted_join_lines() {
+  sort | paste -sd',' -
 }
 
 
@@ -590,6 +615,7 @@ run_backup() {
 
   prune_old_backup_snapshots
   prune_old_backup_files
+  # Intentionally mirror the retained NAS backup window to the cloud target.
   sync_backup_to_cloud "${backup_file}"
   cleanup_backup_mount
   trap - EXIT
@@ -675,7 +701,12 @@ confirm_restore_data() {
 
 
 import_pool_for_recovery() {
+  local current_altroot=""
+
   if zpool list "${POOL_NAME}" >/dev/null 2>&1; then
+    current_altroot="$(zpool get -H -o value altroot "${POOL_NAME}" 2>/dev/null || true)"
+    [[ "${current_altroot}" == "${RECOVERY_ROOT}" ]] || \
+      fatal "Pool ${POOL_NAME} is already imported without altroot ${RECOVERY_ROOT}. Export it first or re-import it for recovery."
     return 0
   fi
 
@@ -755,6 +786,11 @@ run_restore_data() {
 
 mount_recovery_root_dataset() {
   local mounted_source=""
+  local datasets=()
+  local dataset=""
+  local canmount=""
+  local mountpoint_value=""
+  local mounted_value=""
 
   import_pool_for_recovery
   mkdir -p "${RECOVERY_ROOT}"
@@ -764,7 +800,17 @@ mount_recovery_root_dataset() {
     zfs mount "${ROOT_DATASET}"
   fi
 
-  zfs mount -a
+  mapfile -t datasets < <(zfs list -H -o name -r "${POOL_NAME}" 2>/dev/null || true)
+  for dataset in "${datasets[@]}"; do
+    [[ "${dataset}" == "${POOL_NAME}" || "${dataset}" == "${ROOT_DATASET}" ]] && continue
+    canmount="$(zfs_dataset_value "${dataset}" canmount)"
+    mountpoint_value="$(zfs_dataset_value "${dataset}" mountpoint)"
+    mounted_value="$(zfs_dataset_value "${dataset}" mounted)"
+    [[ "${canmount}" == "off" ]] && continue
+    [[ "${mountpoint_value}" == "none" || "${mountpoint_value}" == "legacy" ]] && continue
+    [[ "${mounted_value}" == "yes" ]] && continue
+    zfs mount "${dataset}"
+  done
 }
 
 
@@ -811,7 +857,22 @@ cleanup_recovery_chroot_mounts() {
 
 
 cleanup_recovery_pool_mounts() {
-  zfs unmount -a 2>/dev/null || true
+  local datasets=()
+  local dataset=""
+  local mounted_value=""
+  local index=0
+
+  mapfile -t datasets < <(zfs list -H -o name -r "${POOL_NAME}" 2>/dev/null || true)
+  if (( ${#datasets[@]} == 0 )); then
+    return 0
+  fi
+
+  for (( index=${#datasets[@]} - 1; index>=0; index-- )); do
+    dataset="${datasets[index]}"
+    mounted_value="$(zfs_dataset_value "${dataset}" mounted)"
+    [[ "${mounted_value}" == "yes" ]] || continue
+    zfs unmount -f "${dataset}" 2>/dev/null || true
+  done
 }
 
 
@@ -857,8 +918,11 @@ EOF
 
 write_recovery_mdadm_conf() {
   local md_scan=""
+  local filtered_md_scan=""
 
   md_scan="$(mdadm --detail --scan)"
+  filtered_md_scan="$(grep -E '^ARRAY /dev/md/(efi|boot|swap) ' <<<"${md_scan}" || true)"
+  [[ -n "${filtered_md_scan}" ]] || fatal "Expected md arrays were not found in mdadm --detail --scan output."
   cat > "${RECOVERY_ROOT}/etc/mdadm/mdadm.conf" <<EOF
 # mdadm.conf - Configuration for mdadm RAID arrays
 # Rewritten by ${SCRIPT_NAME} during repair-boot
@@ -867,7 +931,7 @@ HOMEHOST <system>
 MAILADDR root
 
 # RAID array definitions
-${md_scan}
+${filtered_md_scan}
 EOF
 }
 
@@ -878,7 +942,16 @@ set_recovery_zpool_cachefile() {
 }
 
 
+require_recovery_command() {
+  local cmd="$1"
+
+  run_in_recovery_chroot "command -v ${cmd} >/dev/null 2>&1" || fatal "Required command is missing inside the restored system: ${cmd}"
+}
+
+
 list_installed_recovery_kernel_packages() {
+  # dpkg-query emits "<package>\t<want> <error> <status>"; the awk filter
+  # selects only fully installed linux-image packages.
   # shellcheck disable=SC2016
   local dpkg_format='${binary:Package}\t${Status}\n'
 
@@ -889,12 +962,43 @@ list_installed_recovery_kernel_packages() {
 
 reinstall_recovery_kernel_packages() {
   local kernel_packages=()
+  local cached_kernel_debs=()
+  local package_name=""
+  local package_version=""
+  local package_arch=""
+  local expected_deb=""
+  local all_cached=1
+  local dpkg_format=""
 
   mapfile -t kernel_packages < <(list_installed_recovery_kernel_packages)
   (( ${#kernel_packages[@]} > 0 )) || fatal "No installed linux-image packages were found in the restored system."
 
+  # shellcheck disable=SC2016
+  dpkg_format='${Version}\t${Architecture}\n'
+
+  for package_name in "${kernel_packages[@]}"; do
+    read -r package_version package_arch < <(
+      chroot "${RECOVERY_ROOT}" dpkg-query -W -f="${dpkg_format}" "${package_name}" 2>/dev/null
+    )
+    [[ -n "${package_version}" && -n "${package_arch}" ]] || fatal "Unable to determine version/architecture for restored package ${package_name}."
+    expected_deb="${RECOVERY_ROOT}/var/cache/apt/archives/${package_name}_${package_version}_${package_arch}.deb"
+    if [[ -f "${expected_deb}" ]]; then
+      cached_kernel_debs+=("/var/cache/apt/archives/${package_name}_${package_version}_${package_arch}.deb")
+    else
+      all_cached=0
+      break
+    fi
+  done
+
+  if (( all_cached == 1 )); then
+    info "Reinstalling restored kernel packages from local apt cache to repopulate /boot..."
+    chroot "${RECOVERY_ROOT}" dpkg -i "${cached_kernel_debs[@]}"
+    return 0
+  fi
+
   info "Refreshing apt metadata inside the restored system..."
-  chroot "${RECOVERY_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update
+  chroot "${RECOVERY_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || \
+    fatal "Unable to refresh apt metadata inside the restored system, and required kernel packages were not present in the local apt cache."
 
   info "Reinstalling restored kernel packages to repopulate /boot..."
   chroot "${RECOVERY_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive \
@@ -937,6 +1041,15 @@ run_repair_boot() {
   info "Rewriting restored system fstab and mdadm.conf..."
   write_recovery_fstab
   write_recovery_mdadm_conf
+
+  require_recovery_command bash
+  require_recovery_command zpool
+  require_recovery_command apt-get
+  require_recovery_command dpkg-query
+  require_recovery_command dpkg
+  require_recovery_command update-initramfs
+  require_recovery_command update-grub
+  require_recovery_command grub-install
 
   info "Refreshing zpool cache inside the restored system..."
   set_recovery_zpool_cachefile
@@ -1024,16 +1137,54 @@ destroy_or_export_pool() {
 
 
 stop_existing_arrays() {
+  local md_device=""
+  local md_detail=""
+  local md_name=""
+
   swapoff /dev/md/swap 2>/dev/null || true
   mdadm --stop /dev/md/efi 2>/dev/null || true
   mdadm --stop /dev/md/boot 2>/dev/null || true
   mdadm --stop /dev/md/swap 2>/dev/null || true
-  mdadm --stop /dev/md125 2>/dev/null || true
-  mdadm --stop /dev/md126 2>/dev/null || true
-  mdadm --stop /dev/md127 2>/dev/null || true
   mdadm --remove /dev/md/efi 2>/dev/null || true
   mdadm --remove /dev/md/boot 2>/dev/null || true
   mdadm --remove /dev/md/swap 2>/dev/null || true
+
+  for md_device in /dev/md[0-9]*; do
+    [[ -b "${md_device}" ]] || continue
+    md_detail="$(mdadm --detail "${md_device}" 2>/dev/null || true)"
+    [[ -n "${md_detail}" ]] || continue
+    md_name="$(awk -F': ' '/^[[:space:]]+Name : / {print $2}' <<<"${md_detail}")"
+    if grep -Eq "${DISK1}|${DISK2}|${DISK3}" <<<"${md_detail}" || [[ "${md_name}" =~ ^any:(efi|boot|swap)$ ]]; then
+      mdadm --stop "${md_device}" 2>/dev/null || true
+      mdadm --remove "${md_device}" 2>/dev/null || true
+    fi
+  done
+}
+
+
+wait_for_block_devices() {
+  local expected_devices=("$@")
+  local device=""
+  local remaining_checks=20
+  local missing_device=0
+
+  while (( remaining_checks > 0 )); do
+    missing_device=0
+    for device in "${expected_devices[@]}"; do
+      if [[ ! -b "${device}" ]]; then
+        missing_device=1
+        break
+      fi
+    done
+    if (( missing_device == 0 )); then
+      return 0
+    fi
+    udevadm settle
+    sleep 0.2
+    ((remaining_checks-=1))
+  done
+
+  fatal "Timed out waiting for expected block devices: ${expected_devices[*]}"
 }
 
 
@@ -1080,8 +1231,10 @@ partition_target_disks() {
     "${DISK3}"
 
   partprobe "${DISK1}" "${DISK2}" "${DISK3}"
-  udevadm settle
-  sleep 2
+  wait_for_block_devices \
+    "${DISK1}-part1" "${DISK1}-part2" "${DISK1}-part3" "${DISK1}-part4" \
+    "${DISK2}-part1" "${DISK2}-part2" "${DISK2}-part3" "${DISK2}-part4" \
+    "${DISK3}-part1" "${DISK3}-part2"
 }
 
 
@@ -1116,8 +1269,7 @@ create_arrays() {
     --run \
     "${DISK1}-part3" "${DISK2}-part3" "${DISK3}-part1"
 
-  udevadm settle
-  sleep 2
+  wait_for_block_devices /dev/md/efi /dev/md/boot /dev/md/swap
 }
 
 
@@ -1277,12 +1429,24 @@ parse_args() {
 
 
 require_mode_commands() {
+  require_command awk
+  require_command basename
+  require_command grep
+  require_command mkdir
+  require_command paste
+  require_command readlink
+  require_command rm
+  require_command sort
+
   require_command zpool
   require_command zfs
 
   if [[ "${MODE}" == "backup" || "${MODE}" == "full-restore" ]]; then
+    require_command du
     require_command mount
+    require_command mount.cifs
     require_command mountpoint
+    require_command stat
     require_command umount
     require_command zstd
     require_command find
@@ -1290,6 +1454,7 @@ require_mode_commands() {
 
   if [[ "${MODE}" == "restore-data" || "${MODE}" == "full-restore" ]]; then
     require_command mount
+    require_command mount.cifs
     require_command mountpoint
     require_command umount
     require_command zstd
@@ -1297,17 +1462,22 @@ require_mode_commands() {
     require_command sfdisk
     require_command mdadm
     require_command blkid
+    require_command tail
   fi
 
   if [[ "${MODE}" == "repair-boot" || "${MODE}" == "full-restore" ]]; then
+    require_command apt-get
+    require_command blkid
+    require_command chroot
+    require_command dpkg-query
+    require_command findmnt
+    require_command mdadm
     require_command mount
     require_command mountpoint
     require_command umount
-    require_command findmnt
-    require_command chroot
-    require_command mdadm
-    require_command blkid
-    require_command awk
+    require_command update-initramfs
+    require_command update-grub
+    require_command grub-install
   fi
 
   if [[ "${MODE}" == "check-layout" || "${MODE}" == "rebuild-layout" || "${MODE}" == "full-restore" ]]; then
@@ -1317,11 +1487,14 @@ require_mode_commands() {
   fi
 
   if [[ "${MODE}" == "rebuild-layout" || "${MODE}" == "full-restore" ]]; then
+    require_command blkdiscard
     require_command sgdisk
     require_command mkfs.vfat
     require_command mkfs.ext4
     require_command mkswap
     require_command partprobe
+    require_command sleep
+    require_command swapoff
     require_command udevadm
   fi
 }
