@@ -148,7 +148,7 @@ Current boot-repair implementation direction:
 - because `/boot` is not restored from ZFS, `repair-boot` repopulates `/boot` by reinstalling the restored system's installed `linux-image-*` packages
 - the restore flow is intended to complete in a bootable state without requiring a manual chroot session from the user
 
-## Live Layout This Scaffold Models
+## Live Lay out This Scaffold Models
 
 The current scaffold is based on the storage layout of the running system:
 
