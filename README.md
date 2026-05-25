@@ -1,4 +1,4 @@
-# `precision-dr`
+# `precision-zfs-dr`
 
 This directory contains the unified disaster recovery scaffold for the `PRECISION` laptop.
 
@@ -27,7 +27,7 @@ The intended operational end state is also unified:
 
 The authoritative script is:
 
-- [precision-dr.sh](file:///home/me/code/rebuild-drv-layout/precision-dr.sh)
+- [precision-zfs-dr.sh](file:///home/me/code/rebuild-drv-layout/precision-zfs-dr.sh)
 
 ## Phase Model
 
@@ -128,12 +128,12 @@ Design decisions are now settled for this project:
 
 Current implementation note:
 
-- `precision-dr.sh backup` now implements the backup behavior directly in the monolithic project script
-- `precision-dr.sh restore-data` now implements archive selection, verification, and ZFS receive directly in the monolithic project script
-- `precision-dr.sh repair-boot` now implements chroot-based boot repair directly in the monolithic project script
-- `precision-dr.sh full-restore` now implements the synthetic orchestration mode over the real recovery phases
+- `precision-zfs-dr.sh backup` now implements the backup behavior directly in the monolithic project script
+- `precision-zfs-dr.sh restore-data` now implements archive selection, verification, and ZFS receive directly in the monolithic project script
+- `precision-zfs-dr.sh repair-boot` now implements chroot-based boot repair directly in the monolithic project script
+- `precision-zfs-dr.sh full-restore` now implements the synthetic orchestration mode over the real recovery phases
 - `/usr/local/bin/zfs-backup.sh` remains the historical reference input for behavior, not a separate design authority
-- when a required command is missing, `precision-dr.sh` now attempts package installation automatically
+- when a required command is missing, `precision-zfs-dr.sh` now attempts package installation automatically
 - automatic package installation currently supports Debian-family systems only, including Debian and Ubuntu variants
 - package installation is based on an explicit command-to-package map, not inference from command names
 

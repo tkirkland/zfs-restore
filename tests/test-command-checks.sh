@@ -4,7 +4,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
-target_script="${repo_root}/precision-dr.sh"
+target_script="${repo_root}/precision-zfs-dr.sh"
 
 tmpdir="$(mktemp -d)"
 cleanup() {

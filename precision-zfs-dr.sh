@@ -577,7 +577,7 @@ sync_backup_to_cloud() {
     sync_duration=$(( sync_end - sync_start ))
     sync_size="$(stat -c '%s' "${backup_file}")"
     if (( sync_duration > 0 )); then
-      sync_speed="$(awk "BEGIN {printf \"%.2f\", (${sync_size} * 8) / ${sync_duration} / 1000000000}")"
+      sync_speed="$(awk -v size="${sync_size}" -v dur="${sync_duration}" 'BEGIN {printf "%.2f", (size * 8) / dur / 1000000000}')"
       info "Cloud sync complete: ${sync_duration}s @ ${sync_speed} Gbps"
     else
       info "Cloud sync complete."
@@ -945,7 +945,7 @@ set_recovery_zpool_cachefile() {
 require_recovery_command() {
   local cmd="$1"
 
-  run_in_recovery_chroot "command -v ${cmd} >/dev/null 2>&1" || fatal "Required command is missing inside the restored system: ${cmd}"
+  run_in_recovery_chroot "command -v $(printf '%q' "${cmd}") >/dev/null 2>&1" || fatal "Required command is missing inside the restored system: ${cmd}"
 }
 
 
@@ -1168,6 +1168,7 @@ wait_for_block_devices() {
   local remaining_checks=20
   local missing_device=0
 
+  udevadm settle
   while (( remaining_checks > 0 )); do
     missing_device=0
     for device in "${expected_devices[@]}"; do
@@ -1179,7 +1180,6 @@ wait_for_block_devices() {
     if (( missing_device == 0 )); then
       return 0
     fi
-    udevadm settle
     sleep 0.2
     ((remaining_checks-=1))
   done
