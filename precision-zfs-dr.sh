@@ -138,7 +138,7 @@ require_root() {
 
 require_live_environment() {
   if [[ ! -d /cdrom ]] && [[ ! -d /run/live ]]; then
-    fatal "rebuild-layout is restricted to a live OS environment."
+    fatal "${MODE} must be run from a live OS environment."
   fi
 }
 
@@ -330,18 +330,20 @@ blkid_value() {
 check_partition_dump() {
   local disk_real="$1"
   shift
+  local disk_real_re="${disk_real//./\\.}"
   local dump=""
   local expected_partition_count="$#"
   local actual_partition_count=0
   local spec=""
   local spec_line=""
   local fragment=""
+  local -a fragments=()
   local matched=0
 
   dump="$(sfdisk -d "${disk_real}")"
   expect_line_present "${dump}" "label: gpt" "${disk_real} partition label"
   expect_line_present "${dump}" "device: ${disk_real}" "${disk_real} device path"
-  actual_partition_count="$(grep -c "^${disk_real}p[0-9]" <<<"${dump}" || true)"
+  actual_partition_count="$(grep -c "^${disk_real_re}p[0-9]" <<<"${dump}" || true)"
   expect_equal "${actual_partition_count}" "${expected_partition_count}" "${disk_real} partition count"
 
   for spec in "$@"; do
@@ -359,7 +361,7 @@ check_partition_dump() {
       if (( matched == 1 )); then
         break
       fi
-    done < <(grep "^${disk_real}p[0-9]" <<<"${dump}" || true)
+    done < <(grep "^${disk_real_re}p[0-9]" <<<"${dump}" || true)
 
     if (( matched == 0 )); then
       report_mismatch "${disk_real} partition layout: missing semantic match for '${spec}'"
@@ -762,6 +764,8 @@ run_restore_data() {
   local backup_path=""
 
   require_live_environment
+  # Trap covers NAS unmount only. If dataset destruction fails mid-loop, the pool
+  # is left partially destroyed; zfs receive -F on retry handles that correctly.
   trap cleanup_backup_mount EXIT
 
   mount_backup_target
@@ -981,9 +985,10 @@ reinstall_recovery_kernel_packages() {
       chroot "${RECOVERY_ROOT}" dpkg-query -W -f="${dpkg_format}" "${package_name}" 2>/dev/null
     )
     [[ -n "${package_version}" && -n "${package_arch}" ]] || fatal "Unable to determine version/architecture for restored package ${package_name}."
-    expected_deb="${RECOVERY_ROOT}/var/cache/apt/archives/${package_name}_${package_version}_${package_arch}.deb"
+    local encoded_version="${package_version//:/%3a}"
+    expected_deb="${RECOVERY_ROOT}/var/cache/apt/archives/${package_name}_${encoded_version}_${package_arch}.deb"
     if [[ -f "${expected_deb}" ]]; then
-      cached_kernel_debs+=("/var/cache/apt/archives/${package_name}_${package_version}_${package_arch}.deb")
+      cached_kernel_debs+=("/var/cache/apt/archives/${package_name}_${encoded_version}_${package_arch}.deb")
     else
       all_cached=0
       break
@@ -1154,7 +1159,10 @@ stop_existing_arrays() {
     md_detail="$(mdadm --detail "${md_device}" 2>/dev/null || true)"
     [[ -n "${md_detail}" ]] || continue
     md_name="$(awk -F': ' '/^[[:space:]]+Name : / {print $2}' <<<"${md_detail}")"
-    if grep -Eq "${DISK1}|${DISK2}|${DISK3}" <<<"${md_detail}" || [[ "${md_name}" =~ ^any:(efi|boot|swap)$ ]]; then
+    if grep -qF "${DISK1}" <<<"${md_detail}" || \
+       grep -qF "${DISK2}" <<<"${md_detail}" || \
+       grep -qF "${DISK3}" <<<"${md_detail}" || \
+       [[ "${md_name}" =~ ^any:(efi|boot|swap)$ ]]; then
       mdadm --stop "${md_device}" 2>/dev/null || true
       mdadm --remove "${md_device}" 2>/dev/null || true
     fi
