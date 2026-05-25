@@ -70,6 +70,8 @@ DISK3="${DEFAULT_DISK3}"
 ASSUME_YES=0
 CHECK_FAILED=0
 BACKUP_MOUNTED_BY_SCRIPT=0
+BACKUP_SNAPSHOT=""
+BACKUP_FILE_IN_PROGRESS=""
 APT_UPDATED=0
 
 
@@ -270,8 +272,12 @@ install_package_for_command() {
 
 validate_by_id_disk() {
   local disk="$1"
+  local real_path=""
   [[ "${disk}" == /dev/disk/by-id/* ]] || fatal "Disk must be a /dev/disk/by-id path: ${disk}"
   [[ -b "${disk}" ]] || fatal "Disk is not a block device: ${disk}"
+  real_path="$(readlink -f "${disk}")"
+  [[ "${real_path}" =~ ^/dev/nvme[0-9]+n[0-9]+$ ]] || \
+    fatal "Disk resolves to '${real_path}', which is not an NVMe namespace device. This script requires NVMe drives (partition paths use the 'pN' suffix)."
 }
 
 
@@ -415,6 +421,11 @@ check_filesystem_signature() {
   local actual_type=""
   local actual_label=""
 
+  if [[ ! -e "${device}" ]]; then
+    report_mismatch "${device} is missing"
+    return
+  fi
+
   actual_type="$(blkid_value "${device}" TYPE)"
   actual_label="$(blkid_value "${device}" LABEL)"
 
@@ -508,6 +519,13 @@ cleanup_backup_mount() {
 }
 
 
+cleanup_failed_backup() {
+  [[ -z "${BACKUP_FILE_IN_PROGRESS}" ]] || rm -f -- "${BACKUP_FILE_IN_PROGRESS}" 2>/dev/null || true
+  [[ -z "${BACKUP_SNAPSHOT}" ]] || zfs destroy -r "${BACKUP_SNAPSHOT}" 2>/dev/null || true
+  cleanup_backup_mount
+}
+
+
 mount_backup_target() {
   mkdir -p "${BACKUP_MOUNT}"
 
@@ -516,6 +534,7 @@ mount_backup_target() {
     return 0
   fi
 
+  [[ -r "${BACKUP_CREDENTIALS}" ]] || fatal "NAS credentials file not found or unreadable: ${BACKUP_CREDENTIALS}"
   info "Mounting backup target at ${BACKUP_MOUNT}..."
   mount -t cifs "//${BACKUP_NAS}${BACKUP_SHARE}" "${BACKUP_MOUNT}" -o credentials="${BACKUP_CREDENTIALS}"
   BACKUP_MOUNTED_BY_SCRIPT=1
@@ -597,7 +616,7 @@ run_backup() {
   local backup_file=""
   local backup_size=""
 
-  trap cleanup_backup_mount EXIT
+  trap cleanup_failed_backup EXIT
   mount_backup_target
 
   timestamp="$(date +%Y%m%d-%H%M%S)"
@@ -606,12 +625,16 @@ run_backup() {
 
   info "Creating recursive snapshot ${snapshot}..."
   zfs snapshot -r "${snapshot}"
+  BACKUP_SNAPSHOT="${snapshot}"
 
   info "Writing compressed backup stream to ${backup_file}..."
+  BACKUP_FILE_IN_PROGRESS="${backup_file}"
   zfs send -R "${snapshot}" | zstd -T0 > "${backup_file}"
 
   [[ -s "${backup_file}" ]] || fatal "Backup file was created but is empty: ${backup_file}"
   zstd -t "${backup_file}"
+  BACKUP_FILE_IN_PROGRESS=""
+  BACKUP_SNAPSHOT=""
   backup_size="$(du -h "${backup_file}" | awk '{print $1}')"
   info "Backup archive verified: ${backup_size}"
 
@@ -960,13 +983,14 @@ list_installed_recovery_kernel_packages() {
   # shellcheck disable=SC2016
   local dpkg_format='${binary:Package}\t${Status}\n'
 
-  chroot "${RECOVERY_ROOT}" dpkg-query -W -f="${dpkg_format}" 'linux-image-[0-9]*' 2>/dev/null | \
+  chroot "${RECOVERY_ROOT}" dpkg-query -W -f="${dpkg_format}" 'linux-image-[0-9]*' | \
     awk '$2 == "install" && $3 == "ok" && $4 == "installed" {print $1}'
 }
 
 
 reinstall_recovery_kernel_packages() {
   local kernel_packages=()
+  local kernel_packages_raw=""
   local cached_kernel_debs=()
   local package_name=""
   local package_version=""
@@ -976,8 +1000,10 @@ reinstall_recovery_kernel_packages() {
   local all_cached=1
   local dpkg_format=""
 
-  mapfile -t kernel_packages < <(list_installed_recovery_kernel_packages)
-  (( ${#kernel_packages[@]} > 0 )) || fatal "No installed linux-image packages were found in the restored system."
+  kernel_packages_raw="$(list_installed_recovery_kernel_packages)" || \
+    fatal "Failed to query installed kernel packages from the restored system."
+  [[ -n "${kernel_packages_raw}" ]] || fatal "No installed linux-image packages were found in the restored system."
+  mapfile -t kernel_packages <<< "${kernel_packages_raw}"
 
   # shellcheck disable=SC2016
   dpkg_format='${Version}\t${Architecture}\n'
@@ -1029,7 +1055,7 @@ rebuild_recovery_boot_configuration() {
 verify_recovery_boot_artifacts() {
   [[ -L "${RECOVERY_ROOT}/boot/vmlinuz" ]] || fatal "Missing /boot/vmlinuz symlink after repair."
   [[ -L "${RECOVERY_ROOT}/boot/initrd.img" ]] || fatal "Missing /boot/initrd.img symlink after repair."
-  [[ -s "${RECOVERY_ROOT}/boot/grub/grub.cfg" ]] || fatal "Missing /boot/grub/grub.cfg af/compater repair."
+  [[ -s "${RECOVERY_ROOT}/boot/grub/grub.cfg" ]] || fatal "Missing /boot/grub/grub.cfg after repair."
   [[ -s "${RECOVERY_ROOT}/boot/efi/EFI/ubuntu/shimx64.efi" ]] || fatal "Missing EFI ubuntu shim after repair."
   [[ -s "${RECOVERY_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || fatal "Missing fallback EFI bootloader after repair."
 }
