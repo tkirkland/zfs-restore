@@ -27,7 +27,7 @@ The intended operational end state is also unified:
 
 The authoritative script is:
 
-- [precision-dr.sh](/home/me/code/rebuild-drv-layout/precision-dr.sh)
+- [precision-dr.sh](file:///home/me/code/rebuild-drv-layout/precision-dr.sh)
 
 ## Phase Model
 
@@ -54,7 +54,7 @@ Current implementation status:
 The currently implemented scope is:
 
 - backup creation/retention
-- data restore from existing NAS backup archives
+- data restored from existing NAS backup archives
 - boot repair for the restored system
 - full-restore orchestration across the implemented phases
 - storage-layout verification
@@ -64,7 +64,7 @@ That means the script currently does:
 
 - create a recursive compressed ZFS backup on the NAS
 - verify the written backup archive after creation
-- apply retention to backup snapshots and NAS archive files
+- apply retention to back up snapshots and NAS archive files
 - mount the NAS and present existing backup archives newest-first for restore selection
 - verify the selected restore archive before applying it
 - receive the selected backup stream into the rebuilt recovery pool
@@ -117,7 +117,7 @@ Important implication:
 
 - because the current backup script does not back up `/boot` or `/boot/efi`, this project restores bootability by rebuilding boot artifacts after data restore rather than restoring those directories from archive
 
-Design decisions now settled for this project:
+Design decisions are now settled for this project:
 
 - the existing `.zfs.zst` archives produced by `/usr/local/bin/zfs-backup.sh` are valid restore sources
 - restore should consume those archives as-is
@@ -144,7 +144,7 @@ Current boot-repair implementation direction:
 - because `/boot` is not restored from ZFS, `repair-boot` repopulates `/boot` by reinstalling the restored system's installed `linux-image-*` packages
 - the restore flow is intended to complete in a bootable state without requiring a manual chroot session from the user
 
-## Live Layout This Scaffold Models
+## Live Lay out This Scaffold Models
 
 The current scaffold is based on the storage layout of the running system:
 
