@@ -251,7 +251,7 @@ apt_update_once() {
     return 0
   fi
 
-  DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null 2>&1 || \
+  DEBIAN_FRONTEND=noninteractive apt-get -qq update || \
     fatal "Failed to refresh apt package metadata."
   APT_UPDATED=1
 }
@@ -265,7 +265,7 @@ install_package_for_command() {
   package_name="$(package_for_command "${cmd}")" || fatal "No package mapping is defined for required command: ${cmd}"
 
   apt_update_once
-  DEBIAN_FRONTEND=noninteractive apt-get -qq install -y "${package_name}" >/dev/null 2>&1 || \
+  DEBIAN_FRONTEND=noninteractive apt-get -qq install -y "${package_name}" || \
     fatal "Failed to install package '${package_name}' for required command '${cmd}'."
 }
 
@@ -543,10 +543,13 @@ mount_backup_target() {
 
 prune_old_backup_snapshots() {
   local snapshots=()
+  local snapshots_raw=""
   local remove_count=0
   local snapshot=""
 
-  mapfile -t snapshots < <(zfs list -H -t snapshot -o name -s creation | grep "^${POOL_NAME}@backup-" || true)
+  snapshots_raw="$(zfs list -H -t snapshot -o name -s creation)" || \
+    fatal "Failed to list ZFS snapshots for pruning."
+  mapfile -t snapshots < <(grep "^${POOL_NAME}@backup-" <<<"${snapshots_raw}" || true)
   remove_count=$(( ${#snapshots[@]} - BACKUP_KEEP_COUNT ))
   if (( remove_count <= 0 )); then
     return 0
@@ -650,11 +653,14 @@ run_backup() {
 backup_timestamp_from_path() {
   local backup_path="$1"
   local backup_name=""
+  local timestamp=""
 
   backup_name="$(basename -- "${backup_path}")"
   [[ "${backup_name}" == precision-*.zfs.zst ]] || fatal "Backup file name does not match expected pattern: ${backup_name}"
   backup_name="${backup_name#precision-}"
-  printf '%s\n' "${backup_name%.zfs.zst}"
+  timestamp="${backup_name%.zfs.zst}"
+  [[ "${timestamp}" =~ ^[0-9]{8}-[0-9]{6}$ ]] || fatal "Cannot parse timestamp from backup filename: ${backup_name}"
+  printf '%s\n' "${timestamp}"
 }
 
 
@@ -967,6 +973,7 @@ EOF
 set_recovery_zpool_cachefile() {
   mkdir -p "${RECOVERY_ROOT}/etc/zfs"
   run_in_recovery_chroot "zpool set cachefile=/etc/zfs/zpool.cache ${POOL_NAME}"
+  [[ -f "${RECOVERY_ROOT}/etc/zfs/zpool.cache" ]] || fatal "zpool cachefile was not written to the restored system after zpool set."
 }
 
 
