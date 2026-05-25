@@ -1018,7 +1018,7 @@ reinstall_recovery_kernel_packages() {
   for package_name in "${kernel_packages[@]}"; do
     read -r package_version package_arch < <(
       chroot "${RECOVERY_ROOT}" dpkg-query -W -f="${dpkg_format}" "${package_name}" 2>/dev/null
-    )
+    ) || true
     [[ -n "${package_version}" && -n "${package_arch}" ]] || fatal "Unable to determine version/architecture for restored package ${package_name}."
     encoded_version="${package_version//:/%3a}"
     expected_deb="${RECOVERY_ROOT}/var/cache/apt/archives/${package_name}_${encoded_version}_${package_arch}.deb"
@@ -1068,9 +1068,15 @@ verify_recovery_boot_artifacts() {
 }
 
 
+cleanup_repair_boot() {
+  cleanup_recovery_chroot_mounts || true
+  cleanup_recovery_pool_mounts   || true
+}
+
+
 run_repair_boot() {
   require_live_environment
-  trap 'cleanup_recovery_chroot_mounts; cleanup_recovery_pool_mounts' EXIT
+  trap cleanup_repair_boot EXIT
 
   import_pool_for_recovery
   run_check_layout || fatal "repair-boot requires a valid rebuilt/restored layout first."
@@ -1224,7 +1230,7 @@ wait_for_block_devices() {
       return 0
     fi
     sleep 0.2
-    ((remaining_checks-=1))
+    remaining_checks=$(( remaining_checks - 1 ))
   done
 
   fatal "Timed out waiting for expected block devices: ${expected_devices[*]}"
