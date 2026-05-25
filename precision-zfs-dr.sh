@@ -546,7 +546,7 @@ prune_old_backup_files() {
   local entry=""
   local file_path=""
 
-  mapfile -t entries < <(find "${BACKUP_MOUNT}" -maxdepth 1 -name "${BACKUP_FILE_GLOB}" -type f -printf '%T@\t%p\n' 2>/dev/null | sort -n)
+  mapfile -t entries < <(find "${BACKUP_MOUNT}" -maxdepth 1 -name "${BACKUP_FILE_GLOB}" -type f -printf '%f\t%p\n' 2>/dev/null | sort)
   remove_count=$(( ${#entries[@]} - BACKUP_KEEP_COUNT ))
   if (( remove_count <= 0 )); then
     return 0
@@ -927,6 +927,7 @@ write_recovery_mdadm_conf() {
   md_scan="$(mdadm --detail --scan)"
   filtered_md_scan="$(grep -E '^ARRAY /dev/md/(efi|boot|swap) ' <<<"${md_scan}" || true)"
   [[ -n "${filtered_md_scan}" ]] || fatal "Expected md arrays were not found in mdadm --detail --scan output."
+  mkdir -p "${RECOVERY_ROOT}/etc/mdadm"
   cat > "${RECOVERY_ROOT}/etc/mdadm/mdadm.conf" <<EOF
 # mdadm.conf - Configuration for mdadm RAID arrays
 # Rewritten by ${SCRIPT_NAME} during repair-boot
@@ -970,6 +971,7 @@ reinstall_recovery_kernel_packages() {
   local package_name=""
   local package_version=""
   local package_arch=""
+  local encoded_version=""
   local expected_deb=""
   local all_cached=1
   local dpkg_format=""
@@ -985,7 +987,7 @@ reinstall_recovery_kernel_packages() {
       chroot "${RECOVERY_ROOT}" dpkg-query -W -f="${dpkg_format}" "${package_name}" 2>/dev/null
     )
     [[ -n "${package_version}" && -n "${package_arch}" ]] || fatal "Unable to determine version/architecture for restored package ${package_name}."
-    local encoded_version="${package_version//:/%3a}"
+    encoded_version="${package_version//:/%3a}"
     expected_deb="${RECOVERY_ROOT}/var/cache/apt/archives/${package_name}_${encoded_version}_${package_arch}.deb"
     if [[ -f "${expected_deb}" ]]; then
       cached_kernel_debs+=("/var/cache/apt/archives/${package_name}_${encoded_version}_${package_arch}.deb")
@@ -1019,15 +1021,15 @@ rebuild_recovery_boot_configuration() {
   run_in_recovery_chroot "update-grub"
 
   info "Installing GRUB EFI files into the mirrored EFI filesystem..."
-  run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck"
-  run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --removable --recheck"
+  run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Kubuntu --recheck"
+  run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Kubuntu --removable --recheck"
 }
 
 
 verify_recovery_boot_artifacts() {
   [[ -L "${RECOVERY_ROOT}/boot/vmlinuz" ]] || fatal "Missing /boot/vmlinuz symlink after repair."
   [[ -L "${RECOVERY_ROOT}/boot/initrd.img" ]] || fatal "Missing /boot/initrd.img symlink after repair."
-  [[ -s "${RECOVERY_ROOT}/boot/grub/grub.cfg" ]] || fatal "Missing /boot/grub/grub.cfg after repair."
+  [[ -s "${RECOVERY_ROOT}/boot/grub/grub.cfg" ]] || fatal "Missing /boot/grub/grub.cfg af/compater repair."
   [[ -s "${RECOVERY_ROOT}/boot/efi/EFI/ubuntu/shimx64.efi" ]] || fatal "Missing EFI ubuntu shim after repair."
   [[ -s "${RECOVERY_ROOT}/boot/efi/EFI/BOOT/BOOTX64.EFI" ]] || fatal "Missing fallback EFI bootloader after repair."
 }
