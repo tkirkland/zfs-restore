@@ -74,6 +74,7 @@ BACKUP_MOUNTED_BY_SCRIPT=0
 BACKUP_SNAPSHOT=""
 BACKUP_FILE_IN_PROGRESS=""
 APT_UPDATED=0
+VERBOSE=0
 
 
 ##
@@ -98,6 +99,13 @@ error() {
 fatal() {
   error "$*"
   exit 1
+}
+
+
+verbose() {
+  if (( VERBOSE == 1 )); then
+    printf '[VERBOSE] %s\n' "$*"
+  fi
 }
 
 
@@ -128,6 +136,7 @@ Options:
   --disk2 <by-id>  Override disk 2 path. Default: ${DEFAULT_DISK2}
   --disk3 <by-id>  Override disk 3 path. Default: ${DEFAULT_DISK3}
   --yes            Skip destructive confirmation for rebuild-layout.
+  --verbose, -v    Show detailed action output for all phases.
   -h, --help       Show this help text.
 
 Scope notes:
@@ -359,6 +368,7 @@ check_partition_dump() {
   local -a fragments=()
   local matched=0
 
+  verbose "Checking partition table on ${disk_real} (${expected_partition_count} partitions expected)..."
   dump="$(sfdisk -d "${disk_real}")"
   expect_line_present "${dump}" "label: gpt" "${disk_real} partition label"
   expect_line_present "${dump}" "device: ${disk_real}" "${disk_real} device path"
@@ -403,6 +413,7 @@ check_mdadm_array() {
   local expected_members_joined=""
   local actual_name=""
 
+  verbose "Checking mdadm array ${md_device} (${raid_level} x${raid_devices})..."
   [[ -e "${md_device}" ]] || {
     report_mismatch "${md_device} is missing"
     return
@@ -434,6 +445,7 @@ check_filesystem_signature() {
   local actual_type=""
   local actual_label=""
 
+  verbose "Checking filesystem on ${device} (type=${expected_type} label=${expected_label})..."
   if [[ ! -e "${device}" ]]; then
     report_mismatch "${device} is missing"
     return
@@ -452,6 +464,7 @@ check_zpool_members() {
   local actual_members=""
   local expected_members_joined=""
 
+  verbose "Checking zpool ${POOL_NAME} member devices..."
   if ! zpool list "${POOL_NAME}" >/dev/null 2>&1; then
     report_mismatch "zpool ${POOL_NAME} is missing"
     return
@@ -478,6 +491,7 @@ check_zpool_property() {
   local expected="$2"
   local actual=""
 
+  verbose "Checking zpool ${POOL_NAME}: ${property}=${expected}"
   actual="$(zpool get -H -o value "${property}" "${POOL_NAME}" 2>/dev/null || true)"
   expect_equal "${actual}" "${expected}" "zpool ${POOL_NAME} property ${property}"
 }
@@ -489,6 +503,7 @@ check_zfs_property() {
   local expected="$3"
   local actual=""
 
+  verbose "Checking dataset ${dataset}: ${property}=${expected}"
   if ! zfs list -H -o name "${dataset}" >/dev/null 2>&1; then
     report_mismatch "dataset ${dataset} is missing"
     return
@@ -553,6 +568,7 @@ mount_backup_target() {
 
   [[ -r "${BACKUP_CREDENTIALS}" ]] || fatal "NAS credentials file not found or unreadable: ${BACKUP_CREDENTIALS}"
   info "Mounting backup target at ${BACKUP_MOUNT}..."
+  verbose "mount -t cifs //${BACKUP_NAS}${BACKUP_SHARE} ${BACKUP_MOUNT} -o credentials=${BACKUP_CREDENTIALS}"
   mount -t cifs "//${BACKUP_NAS}${BACKUP_SHARE}" "${BACKUP_MOUNT}" -o credentials="${BACKUP_CREDENTIALS}"
   BACKUP_MOUNTED_BY_SCRIPT=1
 }
@@ -644,14 +660,17 @@ run_backup() {
   backup_file="${BACKUP_MOUNT}/precision-${timestamp}.zfs.zst"
 
   info "Creating recursive snapshot ${snapshot}..."
+  verbose "zfs snapshot -r ${snapshot}"
   zfs snapshot -r "${snapshot}"
   BACKUP_SNAPSHOT="${snapshot}"
 
   info "Writing compressed backup stream to ${backup_file}..."
+  verbose "zfs send -R ${snapshot} | zstd -T0 > ${backup_file}"
   BACKUP_FILE_IN_PROGRESS="${backup_file}"
   zfs send -R "${snapshot}" | zstd -T0 > "${backup_file}"
 
   [[ -s "${backup_file}" ]] || fatal "Backup file was created but is empty: ${backup_file}"
+  verbose "zstd -t ${backup_file}"
   zstd -t "${backup_file}"
   BACKUP_FILE_IN_PROGRESS=""
   BACKUP_SNAPSHOT=""
@@ -763,6 +782,7 @@ import_pool_for_recovery() {
   fi
 
   info "Importing pool ${POOL_NAME} for recovery..."
+  verbose "zpool import -N -R ${RECOVERY_ROOT} -d /dev/disk/by-id ${POOL_NAME}"
   zpool import -N -R "${RECOVERY_ROOT}" -d /dev/disk/by-id "${POOL_NAME}"
 }
 
@@ -778,6 +798,7 @@ destroy_existing_pool_datasets() {
 
   info "Destroying existing datasets in ${POOL_NAME} before restore..."
   for (( index=${#datasets[@]} - 1; index>=0; index-- )); do
+    verbose "zfs destroy -r ${datasets[index]}"
     zfs destroy -r "${datasets[index]}"
   done
 }
@@ -794,6 +815,7 @@ destroy_existing_pool_snapshots() {
 
   info "Destroying existing snapshots in ${POOL_NAME} before restore..."
   for (( index=${#snapshots[@]} - 1; index>=0; index-- )); do
+    verbose "zfs destroy ${snapshots[index]}"
     zfs destroy "${snapshots[index]}"
   done
 }
@@ -828,6 +850,7 @@ run_restore_data() {
   destroy_existing_pool_datasets
 
   info "Receiving backup stream from ${backup_path} into ${POOL_NAME}..."
+  verbose "zstd -d -c ${backup_path} | zfs receive -u -F ${POOL_NAME}"
   zstd -d -c "${backup_path}" | zfs receive -u -F "${POOL_NAME}"
 
   verify_restored_snapshot "${backup_path}"
@@ -867,6 +890,7 @@ mount_recovery_root_dataset() {
     [[ "${canmount}" == "off" ]] && continue
     [[ "${mountpoint_value}" == "none" || "${mountpoint_value}" == "legacy" ]] && continue
     [[ "${mounted_value}" == "yes" ]] && continue
+    verbose "zfs mount ${dataset}"
     zfs mount "${dataset}"
   done
 }
@@ -877,11 +901,13 @@ mount_recovery_boot_filesystems() {
 
   if ! mountpoint -q "${RECOVERY_ROOT}/boot"; then
     info "Mounting /boot recovery filesystem..."
+    verbose "mount /dev/md/boot ${RECOVERY_ROOT}/boot"
     mount /dev/md/boot "${RECOVERY_ROOT}/boot"
   fi
 
   if ! mountpoint -q "${RECOVERY_ROOT}/boot/efi"; then
     info "Mounting /boot/efi recovery filesystem..."
+    verbose "mount /dev/md/efi ${RECOVERY_ROOT}/boot/efi"
     mount /dev/md/efi "${RECOVERY_ROOT}/boot/efi"
   fi
 }
@@ -962,6 +988,7 @@ write_recovery_fstab() {
   [[ -n "${efi_uuid}" ]] || fatal "Unable to determine UUID for /dev/md/efi"
   [[ -n "${swap_uuid}" ]] || fatal "Unable to determine UUID for /dev/md/swap"
 
+  verbose "Writing ${RECOVERY_ROOT}/etc/fstab (boot=${boot_uuid} efi=${efi_uuid} swap=${swap_uuid})..."
   cat > "${RECOVERY_ROOT}/etc/fstab" <<EOF
 # /etc/fstab - static file system information
 # Rewritten by ${SCRIPT_NAME} during repair-boot
@@ -986,6 +1013,7 @@ write_recovery_mdadm_conf() {
   filtered_md_scan="$(grep -E '^ARRAY /dev/md/(efi|boot|swap) ' <<<"${md_scan}" || true)"
   [[ -n "${filtered_md_scan}" ]] || fatal "Expected md arrays were not found in mdadm --detail --scan output."
   mkdir -p "${RECOVERY_ROOT}/etc/mdadm"
+  verbose "Writing ${RECOVERY_ROOT}/etc/mdadm/mdadm.conf..."
   cat > "${RECOVERY_ROOT}/etc/mdadm/mdadm.conf" <<EOF
 # mdadm.conf - Configuration for mdadm RAID arrays
 # Rewritten by ${SCRIPT_NAME} during repair-boot
@@ -1001,6 +1029,7 @@ EOF
 
 set_recovery_zpool_cachefile() {
   mkdir -p "${RECOVERY_ROOT}/etc/zfs"
+  verbose "chroot: zpool set cachefile=/etc/zfs/zpool.cache ${POOL_NAME}"
   run_in_recovery_chroot "zpool set cachefile=/etc/zfs/zpool.cache ${POOL_NAME}"
   [[ -f "${RECOVERY_ROOT}/etc/zfs/zpool.cache" ]] || fatal "zpool cachefile was not written to the restored system after zpool set."
 }
@@ -1077,13 +1106,17 @@ reinstall_recovery_kernel_packages() {
 
 rebuild_recovery_boot_configuration() {
   info "Rebuilding initramfs for all installed kernels..."
+  verbose "chroot: update-initramfs -u -k all"
   run_in_recovery_chroot "update-initramfs -u -k all"
 
   info "Regenerating GRUB configuration..."
+  verbose "chroot: update-grub"
   run_in_recovery_chroot "update-grub"
 
   info "Installing GRUB EFI files into the mirrored EFI filesystem..."
+  verbose "chroot: grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Kubuntu --recheck"
   run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Kubuntu --recheck"
+  verbose "chroot: grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Kubuntu --removable --recheck"
   run_in_recovery_chroot "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Kubuntu --removable --recheck"
 }
 
@@ -1210,6 +1243,7 @@ check_layout() {
 
 destroy_or_export_pool() {
   if zpool list "${POOL_NAME}" >/dev/null 2>&1; then
+    verbose "zpool export -f ${POOL_NAME} (or destroy if export fails)"
     zpool export -f "${POOL_NAME}" 2>/dev/null || zpool destroy -f "${POOL_NAME}" 2>/dev/null || true
   fi
 }
@@ -1220,6 +1254,7 @@ stop_existing_arrays() {
   local md_detail=""
   local md_name=""
 
+  verbose "Stopping efi/boot/swap arrays and any other arrays using the target disks..."
   swapoff /dev/md/swap 2>/dev/null || true
   mdadm --stop /dev/md/efi 2>/dev/null || true
   mdadm --stop /dev/md/boot 2>/dev/null || true
@@ -1272,11 +1307,13 @@ wait_for_block_devices() {
 
 zero_superblocks() {
   local member=""
+  verbose "Zeroing md superblocks on all target partition members..."
   for member in \
     "${DISK1}-part1" "${DISK1}-part2" "${DISK1}-part3" \
     "${DISK2}-part1" "${DISK2}-part2" "${DISK2}-part3" \
     "${DISK3}-part1"
   do
+    verbose "mdadm --zero-superblock ${member}"
     mdadm --zero-superblock "${member}" 2>/dev/null || true
   done
 }
@@ -1285,6 +1322,7 @@ zero_superblocks() {
 wipe_target_disks() {
   local disk=""
   for disk in "${DISK1}" "${DISK2}" "${DISK3}"; do
+    verbose "wipefs -af ${disk}; sgdisk --zap-all ${disk}; blkdiscard -f ${disk}"
     wipefs -af "${disk}" 2>/dev/null || true
     sgdisk --zap-all "${disk}"
     blkdiscard -f "${disk}" 2>/dev/null || true
@@ -1293,6 +1331,7 @@ wipe_target_disks() {
 
 
 partition_target_disks() {
+  verbose "Partitioning ${DISK1}: EFI1(512M) BOOT1(2G) SWAP1(4G) ZFS1(rest)"
   sgdisk \
     -n1:1M:+512M -t1:EF00 -c1:EFI1 \
     -n2:0:+2G    -t2:FD00 -c2:BOOT1 \
@@ -1300,6 +1339,7 @@ partition_target_disks() {
     -n4:0:0      -t4:BF00 -c4:ZFS1 \
     "${DISK1}"
 
+  verbose "Partitioning ${DISK2}: EFI2(512M) BOOT2(2G) SWAP2(4G) ZFS2(rest)"
   sgdisk \
     -n1:1M:+512M -t1:EF00 -c1:EFI2 \
     -n2:0:+2G    -t2:FD00 -c2:BOOT2 \
@@ -1307,6 +1347,7 @@ partition_target_disks() {
     -n4:0:0      -t4:BF00 -c4:ZFS2 \
     "${DISK2}"
 
+  verbose "Partitioning ${DISK3}: SWAP3(4G) ZFS3(rest)"
   sgdisk \
     -n1:1M:+4G -t1:FD00 -c1:SWAP3 \
     -n2:0:0    -t2:BF00 -c2:ZFS3 \
@@ -1321,6 +1362,7 @@ partition_target_disks() {
 
 
 create_arrays() {
+  verbose "mdadm --create /dev/md/efi (raid1, metadata=1.0, members: ${DISK1}-part1 ${DISK2}-part1)"
   mdadm --create /dev/md/efi \
     --level=1 \
     --raid-devices=2 \
@@ -1331,6 +1373,7 @@ create_arrays() {
     --run \
     "${DISK1}-part1" "${DISK2}-part1"
 
+  verbose "mdadm --create /dev/md/boot (raid1, metadata=1.0, members: ${DISK1}-part2 ${DISK2}-part2)"
   mdadm --create /dev/md/boot \
     --level=1 \
     --raid-devices=2 \
@@ -1341,6 +1384,7 @@ create_arrays() {
     --run \
     "${DISK1}-part2" "${DISK2}-part2"
 
+  verbose "mdadm --create /dev/md/swap (raid0, metadata=1.2, members: ${DISK1}-part3 ${DISK2}-part3 ${DISK3}-part1)"
   mdadm --create /dev/md/swap \
     --level=0 \
     --raid-devices=3 \
@@ -1356,8 +1400,11 @@ create_arrays() {
 
 
 format_arrays() {
+  verbose "mkfs.vfat -F 32 -n EFI /dev/md/efi"
   mkfs.vfat -F 32 -n EFI /dev/md/efi
+  verbose "mkfs.ext4 -F -L boot /dev/md/boot"
   mkfs.ext4 -F -L boot /dev/md/boot
+  verbose "mkswap -L swap /dev/md/swap"
   mkswap -L swap /dev/md/swap
 }
 
@@ -1366,6 +1413,7 @@ format_arrays() {
 create_pool_and_datasets() {
   mkdir -p "${RECOVERY_ROOT}"
 
+  verbose "zpool create ${POOL_NAME} raidz1 ${DISK1}-part4 ${DISK2}-part4 ${DISK3}-part2"
   zpool create -f \
     -o ashift=12 \
     -o autotrim=on \
@@ -1505,6 +1553,9 @@ parse_args() {
         ;;
       --yes)
         ASSUME_YES=1
+        ;;
+      --verbose|-v)
+        VERBOSE=1
         ;;
       -h|--help)
         usage
