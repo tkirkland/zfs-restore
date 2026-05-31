@@ -103,6 +103,10 @@ sudo ./precision-zfs-dr.sh <mode> [options]
 `export_recovery_pool` `run_in_recovery_chroot`
 `write_recovery_fstab` `write_recovery_mdadm_conf`
 `set_recovery_zpool_cachefile` `require_recovery_command`
+`recovery_os_release_field` `apt_source_uses_install_media`
+`disable_recovery_install_media_apt_sources`
+`write_recovery_online_apt_sources`
+`configure_recovery_online_apt_sources`
 `list_installed_recovery_kernel_packages`
 `reinstall_recovery_kernel_packages`
 `rebuild_recovery_boot_configuration` `verify_recovery_boot_artifacts`
@@ -128,6 +132,8 @@ Tests covered:
 - `assert_package_mapping_for_commands` — verifies every required command has a package mapping
 - `test_require_command_install_path_with_fake_apt` — exercises apt install path with a fake apt-get
 - `test_require_recovery_command_paths` — exercises chroot command check paths
+- `test_configure_recovery_online_apt_sources_ubuntu` — verifies local install-media apt sources are disabled and Ubuntu online sources are written
+- `test_configure_recovery_online_apt_sources_debian` — verifies Debian online sources are written
 
 Run: `sudo bash tests/test-command-checks.sh`
 

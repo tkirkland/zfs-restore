@@ -24,6 +24,7 @@ readonly BACKUP_CREDENTIALS="/etc/sysbackup/nas.cred"
 readonly BACKUP_KEEP_COUNT=4
 readonly BACKUP_FILE_GLOB="precision-*.zfs.zst"
 readonly CLOUD_SYNC_TARGET="gdrive:precision-backups/"
+readonly RECOVERY_ONLINE_APT_SOURCE="zz-precision-zfs-dr-online.sources"
 
 readonly DEFAULT_DISK1="/dev/disk/by-id/nvme-eui.0025384331408197"
 readonly DEFAULT_DISK2="/dev/disk/by-id/nvme-eui.002538433140818a"
@@ -196,6 +197,126 @@ require_debian_family() {
   fi
 
   fatal "Automatic package installation is only supported on Debian/Ubuntu-based systems. Detected ID='${os_id}' ID_LIKE='${os_like}'."
+}
+
+
+recovery_os_release_field() {
+  local recovery_root="$1"
+  local field_name="$2"
+
+  [[ -r "${recovery_root}/etc/os-release" ]] || fatal "Cannot detect restored operating system: ${recovery_root}/etc/os-release is missing."
+
+  awk -F= -v field_name="${field_name}" '
+    $1 == field_name {
+      value = $0
+      sub(/^[^=]*=/, "", value)
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "${recovery_root}/etc/os-release"
+}
+
+
+apt_source_uses_install_media() {
+  local source_file="$1"
+
+  grep -Eq '^[[:space:]]*deb(-src)?([[:space:]]+\[[^]]*\])?[[:space:]]+(cdrom:|file:)' "${source_file}" || \
+    grep -Eq '^[[:space:]]*URIs:[[:space:]].*(cdrom:|file:)' "${source_file}"
+}
+
+
+disable_recovery_install_media_apt_sources() {
+  local recovery_root="$1"
+  local disabled_count=0
+  local source_file=""
+  local source_files=(
+    "${recovery_root}/etc/apt/sources.list"
+    "${recovery_root}/etc/apt/sources.list.d/"*.list
+    "${recovery_root}/etc/apt/sources.list.d/"*.sources
+  )
+
+  for source_file in "${source_files[@]}"; do
+    [[ -f "${source_file}" ]] || continue
+    apt_source_uses_install_media "${source_file}" || continue
+
+    cat > "${source_file}" <<EOF
+# Disabled by ${SCRIPT_NAME} during repair-boot.
+# This file referenced local install media and was replaced so apt uses online repositories.
+EOF
+    (( disabled_count += 1 ))
+  done
+
+  if (( disabled_count > 0 )); then
+    info "Disabled ${disabled_count} restored apt source file(s) that referenced local install media."
+  fi
+}
+
+
+write_recovery_online_apt_sources() {
+  local recovery_root="$1"
+  local os_id=""
+  local os_like=""
+  local codename=""
+  local apt_source_dir="${recovery_root}/etc/apt/sources.list.d"
+  local apt_source_file="${apt_source_dir}/${RECOVERY_ONLINE_APT_SOURCE}"
+
+  os_id="$(recovery_os_release_field "${recovery_root}" ID)"
+  os_like="$(recovery_os_release_field "${recovery_root}" ID_LIKE)"
+
+  mkdir -p "${apt_source_dir}"
+
+  if [[ "${os_id}" == "ubuntu" || "${os_like}" == *ubuntu* ]]; then
+    codename="$(recovery_os_release_field "${recovery_root}" UBUNTU_CODENAME)"
+    [[ -n "${codename}" ]] || codename="$(recovery_os_release_field "${recovery_root}" VERSION_CODENAME)"
+    [[ -n "${codename}" ]] || fatal "Cannot configure restored apt sources: Ubuntu codename is missing from ${recovery_root}/etc/os-release."
+
+    cat > "${apt_source_file}" <<EOF
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu
+Suites: ${codename} ${codename}-updates ${codename}-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu
+Suites: ${codename}-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+    return 0
+  fi
+
+  if [[ "${os_id}" == "debian" || "${os_like}" == *debian* ]]; then
+    codename="$(recovery_os_release_field "${recovery_root}" VERSION_CODENAME)"
+    [[ -n "${codename}" ]] || fatal "Cannot configure restored apt sources: Debian codename is missing from ${recovery_root}/etc/os-release."
+
+    cat > "${apt_source_file}" <<EOF
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: ${codename} ${codename}-updates
+Components: main contrib non-free
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: ${codename}-security
+Components: main contrib non-free
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    return 0
+  fi
+
+  fatal "Automatic online apt source configuration is only supported for restored Debian/Ubuntu-based systems. Detected ID='${os_id}' ID_LIKE='${os_like}'."
+}
+
+
+configure_recovery_online_apt_sources() {
+  local recovery_root="${1:-${RECOVERY_ROOT}}"
+
+  disable_recovery_install_media_apt_sources "${recovery_root}"
+  write_recovery_online_apt_sources "${recovery_root}"
 }
 
 
@@ -1094,7 +1215,10 @@ reinstall_recovery_kernel_packages() {
     return 0
   fi
 
-  info "Refreshing apt metadata inside the restored system..."
+  info "Configuring restored apt sources to use online repositories..."
+  configure_recovery_online_apt_sources
+
+  info "Refreshing apt metadata from online repositories inside the restored system..."
   chroot "${RECOVERY_ROOT}" /usr/bin/env DEBIAN_FRONTEND=noninteractive apt-get update || \
     fatal "Unable to refresh apt metadata inside the restored system, and required kernel packages were not present in the local apt cache."
 

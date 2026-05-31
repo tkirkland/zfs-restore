@@ -140,6 +140,7 @@ Current implementation note:
 - when a required command is missing, `precision-zfs-dr.sh` now attempts package installation automatically
 - automatic package installation currently supports Debian-family systems only, including Debian and Ubuntu variants
 - package installation is based on an explicit command-to-package map, not inference from command names
+- during `repair-boot`, restored apt sources that point at local install media are replaced with script-managed online Debian/Ubuntu sources before kernel package reinstallation
 
 Current boot-repair implementation direction:
 

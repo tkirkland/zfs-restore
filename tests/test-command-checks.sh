@@ -41,6 +41,19 @@ assert_equals() {
 }
 
 
+assert_contains() {
+  local haystack="$1"
+  local needle="$2"
+  local label="$3"
+
+  [[ "${haystack}" == *"${needle}"* ]] || {
+    printf 'Expected to find:\n%s\n' "${needle}" >&2
+    printf 'Within:\n%s\n' "${haystack}" >&2
+    fail "${label}"
+  }
+}
+
+
 capture_sorted_unique_lines() {
   sort -u | sed '/^$/d'
 }
@@ -210,6 +223,65 @@ test_require_recovery_command_paths() {
 }
 
 
+test_configure_recovery_online_apt_sources_ubuntu() {
+  local recovery_root="${tmpdir}/recovery-ubuntu"
+  local online_source=""
+
+  mkdir -p "${recovery_root}/etc/apt/sources.list.d"
+  cat > "${recovery_root}/etc/os-release" <<'EOF'
+ID=ubuntu
+ID_LIKE=debian
+VERSION_CODENAME=noble
+UBUNTU_CODENAME=noble
+EOF
+  cat > "${recovery_root}/etc/apt/sources.list" <<'EOF'
+deb cdrom:[Kubuntu 24.04 LTS _Noble Numbat_] noble main restricted
+EOF
+  cat > "${recovery_root}/etc/apt/sources.list.d/install-media.sources" <<'EOF'
+Types: deb
+URIs: file:/cdrom
+Suites: noble
+Components: main restricted
+EOF
+
+  configure_recovery_online_apt_sources "${recovery_root}"
+
+  online_source="$(cat "${recovery_root}/etc/apt/sources.list.d/${RECOVERY_ONLINE_APT_SOURCE}")"
+  assert_contains "$(cat "${recovery_root}/etc/apt/sources.list")" "Disabled by ${SCRIPT_NAME}" "Ubuntu cdrom source disabled"
+  assert_contains "$(cat "${recovery_root}/etc/apt/sources.list.d/install-media.sources")" "Disabled by ${SCRIPT_NAME}" "Ubuntu file source disabled"
+  assert_contains "${online_source}" "URIs: http://archive.ubuntu.com/ubuntu" "Ubuntu archive mirror configured"
+  assert_contains "${online_source}" "URIs: http://security.ubuntu.com/ubuntu" "Ubuntu security mirror configured"
+  assert_contains "${online_source}" "Suites: noble noble-updates noble-backports" "Ubuntu update suites configured"
+
+  apt_source_uses_install_media "${recovery_root}/etc/apt/sources.list" && fail "sources.list still references install media"
+  apt_source_uses_install_media "${recovery_root}/etc/apt/sources.list.d/install-media.sources" && fail "install-media.sources still references install media"
+
+  pass "configure_recovery_online_apt_sources replaces Ubuntu install media sources"
+}
+
+
+test_configure_recovery_online_apt_sources_debian() {
+  local recovery_root="${tmpdir}/recovery-debian"
+  local online_source=""
+
+  mkdir -p "${recovery_root}/etc/apt/sources.list.d"
+  cat > "${recovery_root}/etc/os-release" <<'EOF'
+ID=debian
+VERSION_CODENAME=bookworm
+EOF
+
+  configure_recovery_online_apt_sources "${recovery_root}"
+
+  online_source="$(cat "${recovery_root}/etc/apt/sources.list.d/${RECOVERY_ONLINE_APT_SOURCE}")"
+  assert_contains "${online_source}" "URIs: http://deb.debian.org/debian" "Debian archive mirror configured"
+  assert_contains "${online_source}" "URIs: http://security.debian.org/debian-security" "Debian security mirror configured"
+  assert_contains "${online_source}" "Suites: bookworm bookworm-updates" "Debian update suites configured"
+  assert_contains "${online_source}" "Suites: bookworm-security" "Debian security suite configured"
+
+  pass "configure_recovery_online_apt_sources writes Debian online sources"
+}
+
+
 backup_expected="$(cat <<'EOF'
 awk
 basename
@@ -363,6 +435,8 @@ assert_mode_command_set "full-restore" "${full_restore_expected}"
 assert_package_mapping_for_commands "${full_restore_expected}"
 test_require_command_install_path_with_fake_apt
 test_require_recovery_command_paths
+test_configure_recovery_online_apt_sources_ubuntu
+test_configure_recovery_online_apt_sources_debian
 test_backup_timestamp_from_path
 test_check_filesystem_signature_missing_device
 
